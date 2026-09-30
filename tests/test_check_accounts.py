@@ -26,6 +26,7 @@ ACCOUNT_VARS = (
     "GROQ_API_KEY",
     "STRIPE_SECRET_KEY",
     "HF_TOKEN",
+    "HF_SPACE",
 )
 
 
@@ -210,23 +211,7 @@ def test_stripe_fails_when_stripe_answers_in_live_mode(responses):
         check_stripe("sk_test_abc")
 
 
-def test_hf_write_token_passes(responses):
-    responses[check_accounts.HF_WHOAMI_URL] = {
-        "name": "someone",
-        "auth": {"accessToken": {"role": "write"}},
-    }
-
-    assert check_hf("hf_x") == "someone (write token)"
-
-
-def test_hf_read_only_token_fails(responses):
-    responses[check_accounts.HF_WHOAMI_URL] = {
-        "name": "someone",
-        "auth": {"accessToken": {"role": "read"}},
-    }
-
-    with pytest.raises(CheckFailed, match="read-only"):
-        check_hf("hf_x")
+HF_WRITE_TOKEN = {"name": "someone", "auth": {"accessToken": {"role": "write"}}}
 
 
 def hf_fine_grained(*scoped: dict) -> dict:
@@ -241,16 +226,123 @@ def hf_fine_grained(*scoped: dict) -> dict:
     }
 
 
-def test_hf_fine_grained_token_with_repo_write_passes(responses):
-    responses[check_accounts.HF_WHOAMI_URL] = hf_fine_grained(
-        {"entity": {"type": "user", "name": "someone"}, "permissions": ["repo.content.read"]},
-        {
-            "entity": {"type": "space", "name": "someone/tollgate"},
-            "permissions": ["repo.content.read", "repo.write"],
-        },
+def repo_write(entity_type: str, name: str) -> dict:
+    return {
+        "entity": {"type": entity_type, "name": name},
+        "permissions": ["repo.content.read", "repo.write"],
+    }
+
+
+def test_hf_write_token_without_space_says_the_space_is_unchecked(responses):
+    responses[check_accounts.HF_WHOAMI_URL] = HF_WRITE_TOKEN
+
+    assert check_hf("hf_x") == (
+        "someone (write token, can write to user someone; set HF_SPACE to check the Space)"
     )
 
-    assert check_hf("hf_x") == "someone (fine-grained, can write to space someone/tollgate)"
+
+def test_hf_read_only_token_fails(responses):
+    responses[check_accounts.HF_WHOAMI_URL] = {
+        "name": "someone",
+        "auth": {"accessToken": {"role": "read"}},
+    }
+
+    with pytest.raises(CheckFailed, match="read-only"):
+        check_hf("hf_x")
+
+
+def test_hf_fine_grained_token_without_space_says_the_space_is_unchecked(responses):
+    responses[check_accounts.HF_WHOAMI_URL] = hf_fine_grained(
+        {"entity": {"type": "user", "name": "someone"}, "permissions": ["repo.content.read"]},
+        repo_write("model", "someone/other"),
+    )
+
+    assert check_hf("hf_x") == (
+        "someone (fine-grained token, can write to model someone/other; "
+        "set HF_SPACE to check the Space)"
+    )
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        repo_write("space", "someone/tollgate"),
+        repo_write("space", "SomeOne/Tollgate"),
+        repo_write("user", "someone"),
+    ],
+)
+def test_hf_fine_grained_token_that_can_push_to_the_space_passes(responses, scope: dict):
+    responses[check_accounts.HF_WHOAMI_URL] = hf_fine_grained(scope)
+
+    assert check_hf("hf_x", hf_space="someone/tollgate") == (
+        "someone (fine-grained token, can write to someone/tollgate)"
+    )
+
+
+def test_hf_fine_grained_token_with_org_write_passes_for_an_org_space(responses):
+    responses[check_accounts.HF_WHOAMI_URL] = hf_fine_grained(repo_write("org", "acme"))
+
+    assert check_hf("hf_x", hf_space="acme/tollgate") == (
+        "someone (fine-grained token, can write to acme/tollgate)"
+    )
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        repo_write("space", "someone/other-space"),
+        repo_write("model", "someone/tollgate"),
+        repo_write("org", "acme"),
+        {
+            "entity": {"type": "space", "name": "someone/tollgate"},
+            "permissions": ["repo.content.read"],
+        },
+    ],
+)
+def test_hf_fine_grained_token_that_cant_push_to_the_space_fails(responses, scope: dict):
+    # Write access to some other repo passes without HF_SPACE, but not with it.
+    responses[check_accounts.HF_WHOAMI_URL] = hf_fine_grained(scope)
+
+    with pytest.raises(CheckFailed, match="can't confirm .* can push to someone/tollgate"):
+        check_hf("hf_x", hf_space="someone/tollgate")
+
+
+def test_hf_write_token_passes_for_a_space_in_the_users_namespace(responses):
+    responses[check_accounts.HF_WHOAMI_URL] = HF_WRITE_TOKEN
+
+    assert check_hf("hf_x", hf_space="someone/tollgate") == (
+        "someone (write token, can write to someone/tollgate)"
+    )
+
+
+def test_hf_write_token_fails_for_an_org_space(responses):
+    # whoami can't prove the user may push to an organization's Space.
+    responses[check_accounts.HF_WHOAMI_URL] = HF_WRITE_TOKEN
+
+    with pytest.raises(CheckFailed, match="can't confirm .* can push to acme/tollgate"):
+        check_hf("hf_x", hf_space="acme/tollgate")
+
+
+def test_run_check_passes_hf_space_to_the_probe():
+    seen = {}
+
+    def probe(value: str, hf_space: str | None) -> str:
+        seen.update(value=value, hf_space=hf_space)
+        return "ok"
+
+    check = Check("Hugging Face", "HF_TOKEN", probe, options=("hf_space",))
+    run_check(check, keys(hf_token="hf_x", hf_space="someone/tollgate"))
+
+    assert seen == {"value": "hf_x", "hf_space": "someone/tollgate"}
+
+
+@pytest.mark.parametrize("space", ["tollgate", "someone/", "/tollgate", "a/b/c", "some one/x"])
+def test_malformed_hf_space_is_reported(monkeypatch, capsys, space: str):
+    monkeypatch.setenv("HF_SPACE", space)
+    monkeypatch.setattr(check_accounts, "AccountKeys", lambda: AccountKeys(_env_file=None))
+
+    assert check_accounts.main() == 1
+    assert "Invalid .env" in capsys.readouterr().out
 
 
 def test_hf_fine_grained_token_with_read_only_permissions_fails(responses):

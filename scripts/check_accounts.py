@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from redis import Redis
 from sqlalchemy import create_engine, pool, text
@@ -52,6 +52,8 @@ class AccountKeys(BaseSettings):
     groq_api_key: SecretStr | None = None
     stripe_secret_key: SecretStr | None = None
     hf_token: SecretStr | None = None
+    # The Space deploys push to, as owner/name. When set, HF_TOKEN must be able to write to it.
+    hf_space: str | None = Field(default=None, pattern=r"^[\w.-]+/[\w.-]+$")
 
 
 class CheckFailed(Exception):
@@ -114,31 +116,56 @@ def check_stripe(key: str) -> str:
     return "test mode"
 
 
-def check_hf(token: str) -> str:
-    # Deploying pushes to the Space's git remote, so the token must be able to write.
+def check_hf(token: str, hf_space: str | None = None) -> str:
+    # Deploying pushes to the Space's git remote, so the token must be able to write to it.
     # Anything that can't be confirmed as write access fails.
     whoami = _get_json(HF_WHOAMI_URL, token)
     name = whoami["name"]
     access_token = whoami.get("auth", {}).get("accessToken", {})
     role = access_token.get("role")
     if role == "write":
-        return f"{name} (write token)"
-    if role == "fineGrained":
-        scoped = access_token.get("fineGrained", {}).get("scoped", [])
+        # A write token writes wherever its user can, but whoami only proves that for the
+        # user's own namespace, not for an organization's.
+        kind = "write token"
+        writable = [("user", name)]
+    elif role == "fineGrained":
+        kind = "fine-grained token"
         writable = [
-            f"{scope['entity'].get('type')} {scope['entity'].get('name')}"
-            for scope in scoped
+            (scope["entity"].get("type"), scope["entity"].get("name"))
+            for scope in access_token.get("fineGrained", {}).get("scoped", [])
             if HF_REPO_WRITE in scope.get("permissions", []) and "entity" in scope
         ]
+    elif role == "read":
+        raise CheckFailed(f"{name}'s token is read-only; create a write token")
+    else:
+        raise CheckFailed(f"can't confirm {name}'s token can write (role {role!r})")
+
+    if hf_space is None:
         if not writable:
             raise CheckFailed(
-                f"{name}'s fine-grained token can't write to any repo; "
+                f"{name}'s {kind} can't write to any repo; "
                 "give it repo write access to your account or the Space"
             )
-        return f"{name} (fine-grained, can write to {', '.join(writable)})"
-    if role == "read":
-        raise CheckFailed(f"{name}'s token is read-only; create a write token")
-    raise CheckFailed(f"can't confirm {name}'s token can write (role {role!r}); use a write token")
+        # Only proves write access to some repo, not to the Space deploys will push to.
+        targets = ", ".join(f"{entity_type} {entity_name}" for entity_type, entity_name in writable)
+        return f"{name} ({kind}, can write to {targets}; set HF_SPACE to check the Space)"
+    if not any(_hf_covers(entity, hf_space) for entity in writable):
+        raise CheckFailed(
+            f"can't confirm {name}'s {kind} can push to {hf_space}; "
+            "give it repo write access to the Space or its owner"
+        )
+    return f"{name} ({kind}, can write to {hf_space})"
+
+
+def _hf_covers(entity: tuple[str | None, str | None], space: str) -> bool:
+    """Whether write access on a user, org or Space entity covers pushing to `space`."""
+    entity_type, entity_name = entity
+    if entity_name is None:
+        return False
+    if entity_type == "space":
+        return entity_name.casefold() == space.casefold()
+    owner = space.split("/")[0]
+    return entity_type in ("user", "org") and entity_name.casefold() == owner.casefold()
 
 
 def _get_json(url: str, token: str) -> dict[str, Any]:
@@ -164,7 +191,9 @@ def _get_json(url: str, token: str) -> dict[str, Any]:
 class Check:
     label: str
     env_var: str
-    probe: Callable[[str], str]
+    # Called with the key, plus each AccountKeys field named in `options` as a keyword.
+    probe: Callable[..., str]
+    options: tuple[str, ...] = ()
 
 
 CHECKS = [
@@ -173,7 +202,7 @@ CHECKS = [
     Check("Gemini", "GEMINI_API_KEY", check_gemini),
     Check("Groq", "GROQ_API_KEY", check_groq),
     Check("Stripe", "STRIPE_SECRET_KEY", check_stripe),
-    Check("Hugging Face", "HF_TOKEN", check_hf),
+    Check("Hugging Face", "HF_TOKEN", check_hf, options=("hf_space",)),
 ]
 
 
@@ -189,8 +218,11 @@ def run_check(check: Check, keys: AccountKeys, deadline_seconds: float | None = 
     if secret is None:
         return Result(check.label, "missing", f"set {check.env_var} in .env")
     value = secret.get_secret_value()
+    options = {name: getattr(keys, name) for name in check.options}
     try:
-        detail = _run_with_deadline(check.probe, value, deadline_seconds or DEADLINE_SECONDS)
+        detail = _run_with_deadline(
+            lambda: check.probe(value, **options), deadline_seconds or DEADLINE_SECONDS
+        )
     except CheckFailed as exc:
         return Result(check.label, "failed", _redact(str(exc), value))
     except Exception as exc:
@@ -200,7 +232,7 @@ def run_check(check: Check, keys: AccountKeys, deadline_seconds: float | None = 
     return Result(check.label, "ok", detail)
 
 
-def _run_with_deadline(probe: Callable[[str], str], value: str, seconds: float) -> str:
+def _run_with_deadline(probe: Callable[[], str], seconds: float) -> str:
     """Run a probe, giving up after `seconds` so one stuck service can't stall the rest.
 
     Timeouts inside a probe bound single steps; this bounds the whole probe, including
@@ -211,7 +243,7 @@ def _run_with_deadline(probe: Callable[[str], str], value: str, seconds: float) 
 
     def target() -> None:
         try:
-            outcome["detail"] = probe(value)
+            outcome["detail"] = probe()
         except Exception as exc:
             outcome["error"] = exc
 
@@ -240,7 +272,12 @@ def _redact(message: str, value: str) -> str:
 
 
 def main() -> int:
-    keys = AccountKeys()
+    try:
+        keys = AccountKeys()
+    except ValidationError as exc:
+        # hide_input_in_errors keeps the values themselves out of this message.
+        print(f"Invalid .env: {exc}")
+        return 1
     width = max(len(check.label) for check in CHECKS)
     results = []
     for check in CHECKS:

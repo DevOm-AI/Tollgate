@@ -60,6 +60,15 @@ Tollgate refuses to start with a live key (`sk_live_` / `rk_live_`) unless
    the Space's git remote, which a read-only token can't do. A fine-grained token works too,
    as long as it has repo write permission on your account or on the Space.
 3. Paste it as `HF_TOKEN`.
+4. Optional until the Space exists: create a Docker Space for Tollgate and put its
+   `owner/name` in `HF_SPACE` (e.g. `your-username/tollgate`).
+
+With `HF_SPACE` set, the check confirms the token can push to that Space. A write token
+passes for a Space in your own namespace. A fine-grained token needs repo write permission
+on the Space itself, or on the user or organization that owns it. For a Space owned by an
+organization, use a fine-grained token: whoami can't prove a plain write token can push
+there. Without `HF_SPACE`, the check only confirms the token can write to at least one
+repo, and it says so in its output.
 
 ## Check them
 
@@ -75,7 +84,7 @@ Each check is a free, read-only call. None of them spends tokens or money:
 | Upstash      | `PING` over TLS                               |
 | Gemini, Groq | Lists models on the OpenAI-compatible API     |
 | Stripe       | Reads the balance and confirms it's test mode |
-| Hugging Face | `whoami`, and the token can write to repos    |
+| Hugging Face | `whoami`, and the token can push to the Space |
 
 Output looks like this. Keys are never printed.
 
