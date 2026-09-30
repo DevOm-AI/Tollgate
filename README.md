@@ -5,6 +5,30 @@ An LLM API gateway with rate limits, budgets and usage billing.
 > Work in progress. The full README (OpenAI library example, overspend test, architecture,
 > design decisions) comes later.
 
+## Use it with the OpenAI library
+
+Tollgate speaks OpenAI's chat completions API, so the official `openai` library works by
+changing `base_url` and using a Tollgate key:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8001/v1", api_key="tg_live_...")
+
+completion = client.chat.completions.create(
+    model="<model>",
+    messages=[{"role": "user", "content": "Say hello"}],
+    max_tokens=64,
+)
+print(completion.choices[0].message.content)
+```
+
+`model` must be one Tollgate serves. No provider adapters are registered yet, so for now
+every model answers 404 `model_not_found`.
+
+Errors come back in OpenAI's format too, so the library raises its usual exceptions
+(`AuthenticationError` for a wrong or revoked key, `NotFoundError` for an unknown model).
+
 ## Layout
 
 | Path            | What lives there                               |
