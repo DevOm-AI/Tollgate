@@ -97,6 +97,14 @@ class RateLimiter:
             raise RateLimited("tokens", requests, tokens, cost=estimated_tokens)
         return Admission(key_id, tpm_limit, estimated_tokens, requests, tokens)
 
+    async def requests_left(self, key_id: uuid.UUID, rpm_limit: int) -> int | None:
+        """Requests the key could send right now, without taking any. None if Redis is down."""
+        try:
+            return (await self._bucket.take(f"{key_id}:rpm", rpm_limit, 0)).remaining
+        except RedisError as exc:
+            _warn_fail_open(key_id, exc)
+            return None
+
     async def settle(self, admission: Admission, actual_tokens: int) -> TakeResult | None:
         """Give back what the estimate over-took, or take what it under-took.
 
