@@ -9,6 +9,7 @@ from app.api.errors import install_error_handlers
 from app.api.health import router as health_router
 from app.core.config import get_settings
 from app.core.db import engine
+from app.core.http import http_client
 from app.core.redis import redis_client
 
 
@@ -16,6 +17,7 @@ from app.core.redis import redis_client
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
     # Close pooled connections so a restart doesn't leave them open on the server.
+    await http_client.aclose()
     await redis_client.aclose()
     await engine.dispose()
 

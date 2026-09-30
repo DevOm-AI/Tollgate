@@ -16,15 +16,23 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8001/v1", api_key="tg_live_...")
 
 completion = client.chat.completions.create(
-    model="<model>",
+    model="mock",
     messages=[{"role": "user", "content": "Say hello"}],
     max_tokens=64,
 )
 print(completion.choices[0].message.content)
 ```
 
-`model` must be one Tollgate serves. No provider adapters are registered yet, so for now
-every model answers 404 `model_not_found`.
+Models:
+
+| `model`              | Served by                                                   |
+| -------------------- | ----------------------------------------------------------- |
+| `mock`               | The mock provider: fake text, costs nothing (see `MOCK_*`)  |
+| `groq/<model>`       | Groq, e.g. `groq/llama-3.1-8b-instant` (needs `GROQ_API_KEY`) |
+| `gemini/<model>`     | Gemini, e.g. `gemini/gemini-2.5-flash` (needs `GEMINI_API_KEY`) |
+
+Requests without `max_tokens` (or `max_completion_tokens`) get `DEFAULT_MAX_TOKENS` (1,024), so
+every request has a known worst-case cost.
 
 Errors come back in OpenAI's format too, so the library raises its usual exceptions
 (`AuthenticationError` for a wrong or revoked key, `NotFoundError` for an unknown model).
