@@ -2,6 +2,8 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Self
 
+import anyio
+import stripe
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import select
@@ -9,6 +11,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.billing.stripe_billing import StripeBilling, get_stripe_billing
 from app.core.db import get_db
 from app.core.security import generate_api_key, require_admin
 from app.models import ApiKey, Customer, ModelPrice
@@ -89,6 +92,12 @@ class ModelPriceIn(BaseModel):
     output_micros_per_1k: Annotated[int, Field(ge=0, le=INT64_MAX)]
 
 
+class CustomerBillingOut(BaseModel):
+    stripe_customer_id: str
+    subscription_id: str
+    price_id: str
+
+
 class KeyCreated(KeyOut):
     key: str = Field(description="The full key. Shown only in this response; store it now.")
 
@@ -107,6 +116,42 @@ async def create_customer(body: CustomerCreate, db: Db) -> CustomerOut:
         ) from exc
     await db.refresh(customer)
     return CustomerOut.model_validate(customer)
+
+
+@router.post("/customers/{customer_id}/billing")
+async def set_up_billing(
+    customer_id: uuid.UUID,
+    db: Db,
+    billing: Annotated[StripeBilling | None, Depends(get_stripe_billing)],
+) -> CustomerBillingOut:
+    """Give the customer a Stripe customer and a subscription to the usage price, so their
+    usage is billed. Safe to call again: it finds what already exists."""
+    if billing is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Stripe isn't set up: STRIPE_SECRET_KEY is not set",
+        )
+    customer = await db.get(Customer, customer_id)
+    if customer is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
+    try:
+        result = await anyio.to_thread.run_sync(
+            billing.set_up_customer, customer.id, customer.name, customer.stripe_customer_id
+        )
+    except stripe.StripeError as exc:
+        # Stripe's message says what's wrong (e.g. a bad key); no secrets are in it.
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Stripe refused the setup: {exc.user_message or type(exc).__name__}",
+        ) from exc
+    if customer.stripe_customer_id != result.stripe_customer_id:
+        customer.stripe_customer_id = result.stripe_customer_id
+        await db.commit()
+    return CustomerBillingOut(
+        stripe_customer_id=result.stripe_customer_id,
+        subscription_id=result.subscription_id,
+        price_id=result.price_id,
+    )
 
 
 @router.post("/customers/{customer_id}/keys", status_code=status.HTTP_201_CREATED)

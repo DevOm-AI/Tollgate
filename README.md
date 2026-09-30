@@ -107,6 +107,20 @@ curl -X PUT -H "Authorization: Bearer $ADMIN_API_KEY" -H "Content-Type: applicat
   http://localhost:8001/admin/prices
 ```
 
+## Billing with Stripe
+
+Usage is billed through Stripe (test mode) with a billing meter that sums micro-dollars per
+customer, and a monthly metered price of 0.0001 US cents (one micro-dollar) per unit, so an
+invoice is exactly the usage Tollgate recorded, to the cent. With `STRIPE_SECRET_KEY` set:
+
+```bash
+uv run python -m scripts.setup_stripe          # create (or find) the meter and the price
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  http://localhost:8001/admin/customers/<customer-id>/billing   # Stripe customer + subscription
+```
+
+Both are safe to run again: they find what already exists.
+
 ## Rate limits
 
 Each key has two limits, both token buckets in Redis that refill every minute:
