@@ -240,3 +240,49 @@ def test_mock_failing_every_time_opens_its_breaker_and_shows_on_health(api, brea
     health = api.get("/health").json()
     assert health["providers"]["mock"]["state"] == "open"
     assert health["providers"]["fake"]["state"] == "closed"
+
+
+class ClosesBehindYou(CircuitBreaker):
+    """Looks available when the request is admitted, then refuses at attempt time: as if the
+    breaker opened in between (another request's failure)."""
+
+    def available(self) -> bool:
+        return True
+
+    def allow(self) -> bool:
+        return False
+
+
+class AlwaysClosing:
+    def __getitem__(self, name):
+        return ClosesBehindYou()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_breaker_opening_after_admission_is_a_503_that_releases_the_hold(
+    api, fakes, db_engine, stream
+):
+    from app.providers.breaker import get_breakers
+
+    app.dependency_overrides[get_breakers] = lambda: AlwaysClosing()
+    primary, fallback = fakes
+    created = create_key(api)
+
+    response = api.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-chat",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": stream,
+        },
+        headers={"Authorization": f"Bearer {created['key']}"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "providers_unavailable"
+    assert primary.requests == fallback.requests == []
+    with Session(db_engine) as session:
+        held = session.scalars(
+            select(KeySpend).where(KeySpend.key_id == uuid.UUID(created["id"]))
+        ).one()
+    assert (held.spent_micros, held.reserved_micros) == (0, 0)

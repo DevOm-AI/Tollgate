@@ -375,3 +375,31 @@ def test_closing_a_stream_closes_the_providers_response():
 
     # The connection is dropped, so the provider stops generating.
     assert body.closed
+
+
+class BreaksMidStream(httpx2.AsyncByteStream):
+    async def __aiter__(self):
+        chunk = {"object": "chat.completion.chunk", "choices": [{"delta": {"content": "x"}}]}
+        yield f"data: {json.dumps(chunk)}\n\n".encode()
+        raise httpx2.ReadError("connection reset")
+
+
+def test_connection_breaking_mid_stream_is_a_provider_error():
+    upstream = Upstream(lambda req: httpx2.Response(200, stream=BreaksMidStream()))
+
+    async def read_all() -> list:
+        return await collect(GroqProvider("k", upstream.client()).stream(request()))
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(read_all())
+
+    assert exc_info.value.retryable
+
+
+def test_error_body_without_a_message_has_no_upstream_message():
+    upstream = Upstream(lambda req: httpx2.Response(500, json={"error": {"code": 42}}))
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(GroqProvider("k", upstream.client()).complete(request()))
+
+    assert exc_info.value.upstream_message is None

@@ -62,7 +62,8 @@ jobs:
         run: uv run alembic upgrade head
 
       - name: Run tests
-        run: uv run pytest
+        # Coverage below 95% fails the build.
+        run: uv run pytest --cov --cov-fail-under=95
 
   web:
     runs-on: ubuntu-latest

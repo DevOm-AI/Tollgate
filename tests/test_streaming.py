@@ -418,3 +418,52 @@ def test_hang_up_before_the_first_chunk_is_sent_still_settles(api, provider, db_
     assert request.output_tokens == count_text_tokens(STREAM_WORDS[0])
     assert spend(db_engine, created["id"])[1] == 0
     assert not provider.stream_completed
+
+
+def test_stream_with_no_chunks_ends_cleanly_and_bills_nothing(api, provider, db_engine):
+    created = create_key(api)
+
+    async def empty(request):
+        return
+        yield  # An async generator that sends nothing.
+
+    provider.stream = empty
+
+    response = stream(api, created["key"])
+
+    assert response.status_code == 200
+    assert events(response) == ["[DONE]"]
+    assert spend(db_engine, created["id"]) == (0, 0)
+
+
+def test_unexpected_error_opening_a_stream_releases_the_hold(api, provider, db_engine):
+    created = create_key(api)
+    provider.error = RuntimeError("bug in an adapter")
+
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": MODEL, "messages": [{"role": "user", "content": "Hi"}], "stream": True},
+        headers={"Authorization": f"Bearer {created['key']}"},
+    )
+
+    assert response.status_code == 500
+    assert spend(db_engine, created["id"]) == (0, 0)
+    assert logged(db_engine, created["id"]).status == "error"
+
+
+def test_streamed_tool_call_arguments_are_counted(api, provider, db_engine):
+    created = create_key(api)
+    arguments = '{"city": "Pune", "units": "metric"}'
+
+    async def tool_call_stream(request):
+        base = {"id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m"}
+        call = {"index": 0, "function": {"name": "weather", "arguments": arguments}}
+        yield base | {"choices": [{"index": 0, "delta": {"tool_calls": [call]}}]}
+        yield base | {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+
+    provider.stream = tool_call_stream
+
+    stream(api, created["key"])
+
+    assert logged(db_engine, created["id"]).output_tokens == count_text_tokens(arguments)
