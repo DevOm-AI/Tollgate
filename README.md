@@ -40,6 +40,8 @@ Errors come back in OpenAI's format too, so the library raises its usual excepti
 ## Budgets
 
 Each key has a monthly budget (`monthly_budget_micros`, in micro-dollars: 1 USD = 1,000,000).
+Months are calendar months in UTC: each starts with the full budget, and a request that
+straddles midnight on the 1st is charged to the month it started in.
 Money is always whole micro-dollars, never floats, and costs round up.
 
 Before a request reaches a provider, Tollgate reserves its worst-case cost (a byte-count
