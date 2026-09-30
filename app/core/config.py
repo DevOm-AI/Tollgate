@@ -1,3 +1,4 @@
+from datetime import timedelta
 from functools import lru_cache
 from typing import Literal
 
@@ -12,6 +13,9 @@ STRIPE_LIVE_KEY_PREFIXES = ("sk_live_", "rk_live_")
 DEFAULT_ROUTES: dict[str, list[str]] = {
     "fast-chat": ["groq/llama-3.1-8b-instant", "gemini/gemini-2.5-flash"],
 }
+
+# How long a budget reservation may stay open before the sweep releases it as leaked.
+RESERVATION_TTL = timedelta(minutes=10)
 
 # Customer keys start with this; the admin key must not look like one.
 CUSTOMER_KEY_PREFIX = "tg_live_"
@@ -112,6 +116,19 @@ class Settings(BaseSettings):
                         f"route {name!r}: {target!r} must be 'mock' or '<provider>/<model>'"
                     )
         return routes
+
+    @model_validator(mode="after")
+    def _routes_fit_in_a_reservation(self) -> "Settings":
+        # Each model in a route may use the full total timeout. If trying them all could
+        # outlast the reservation, the sweep would release money still in use.
+        limit = RESERVATION_TTL.total_seconds()
+        for name, targets in self.routes.items():
+            if len(targets) * self.provider_total_timeout_s >= limit:
+                raise ValueError(
+                    f"route {name!r}: {len(targets)} models x {self.provider_total_timeout_s:g} s "
+                    f"could outlast a {limit:g} s budget reservation"
+                )
+        return self
 
     @model_validator(mode="after")
     def _refuse_live_stripe_key(self) -> "Settings":

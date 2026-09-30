@@ -1,18 +1,16 @@
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from sqlalchemy import func, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import RESERVATION_TTL
 from app.models import ApiKey, KeySpend, RequestLog, Reservation, UsageOutbox
 
 logger = logging.getLogger(__name__)
-
-# How long a reservation may stay open before it counts as leaked (e.g. a crash mid-request).
-RESERVATION_TTL = timedelta(minutes=10)
 
 
 def current_period(now: datetime | None = None) -> str:

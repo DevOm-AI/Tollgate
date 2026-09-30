@@ -1,7 +1,8 @@
 import json
+import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated, Any
 
 import anyio
@@ -38,6 +39,8 @@ from app.providers.base import (
 from app.providers.catalog import Catalog, get_catalog
 from app.providers.tokens import count_usage
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/v1", tags=["openai"])
 
 
@@ -65,25 +68,63 @@ def _invalid_key(message: str) -> OpenAIError:
     )
 
 
+@dataclass(frozen=True)
+class Attempt:
+    """One provider a request can go to, with the request as that provider gets it."""
+
+    provider: Provider
+    upstream: ChatCompletionRequest
+    price: ModelPrice
+
+
 @dataclass
 class GatedCall:
     """A request that passed every gate (price, rate limits, budget) and holds its money.
 
-    Every way out must call `finish` exactly once, which settles both the budget and the
-    rate limits.
+    It tries `attempts` in order (the route's primary, then its fallbacks), moving on only
+    before any output has reached the client. Every way out must call `finish` exactly once,
+    which settles both the budget and the rate limits, at the price of the attempt that
+    answered.
     """
 
     db: AsyncSession
     limiter: RateLimiter
-    provider: Provider
-    upstream: ChatCompletionRequest
-    price: ModelPrice
+    attempts: list[Attempt]
     admission: Admission
     hold: Hold
     model: str  # As the customer asked for it.
     started: float
     first_token_timeout_s: float
-    deadline: float  # anyio.current_time() by which the whole answer must be in.
+    total_timeout_s: float
+    current: int = 0
+    # anyio.current_time() by which the current attempt's whole answer must be in.
+    deadline: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.deadline = anyio.current_time() + self.total_timeout_s
+
+    @property
+    def attempt(self) -> Attempt:
+        return self.attempts[self.current]
+
+    def fall_back(self, error: ProviderError) -> bool:
+        """Move to the next provider if `error` is worth retrying elsewhere and one is left.
+
+        Each provider gets its own first-token and total timeouts: a fresh provider deserves
+        a fair chance. (Settings keep a route's worst case inside a reservation's lifetime.)
+        """
+        if not error.retryable or self.current + 1 >= len(self.attempts):
+            return False
+        failed = self.attempt.provider.name
+        self.current += 1
+        self.deadline = anyio.current_time() + self.total_timeout_s
+        logger.warning(
+            "Provider %s failed (%s); falling back to %s",
+            failed,
+            error,
+            self.attempt.provider.name,
+        )
+        return True
 
     def time_left(self) -> float:
         return max(0.0, self.deadline - anyio.current_time())
@@ -99,6 +140,7 @@ class GatedCall:
         Shielded, so a cancelled request (client gone, shutdown) still settles instead of
         leaving the money held until the sweep.
         """
+        price = self.attempt.price
         with anyio.CancelScope(shield=True):
             await settle(
                 self.db,
@@ -106,12 +148,12 @@ class GatedCall:
                 cost_micros(
                     input_tokens,
                     output_tokens,
-                    self.price.input_micros_per_1k,
-                    self.price.output_micros_per_1k,
+                    price.input_micros_per_1k,
+                    price.output_micros_per_1k,
                 ),
                 Outcome(
                     model=self.model,
-                    provider=self.provider.name,
+                    provider=self.attempt.provider.name,
                     status=status_,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
@@ -141,15 +183,23 @@ async def chat_completions(
     failure: ProviderError | None = None
     status_ = "error"  # Anything unexpected, until known otherwise.
     try:
-        with anyio.fail_after(call.time_left()):
-            completion = await call.provider.complete(call.upstream)
-        status_ = "ok"
-    except TimeoutError:
-        failure = ProviderTimeout(f"{call.provider.name}: no answer in time")
-        status_ = "timeout"
-    except ProviderError as exc:
-        failure = exc
-        status_ = _failure_status(exc)
+        while True:
+            attempt = call.attempt
+            try:
+                with anyio.fail_after(call.time_left()):
+                    completion = await attempt.provider.complete(attempt.upstream)
+                status_ = "ok"
+                break
+            except TimeoutError:
+                error: ProviderError = ProviderTimeout(
+                    f"{attempt.provider.name}: no answer in time"
+                )
+            except ProviderError as exc:
+                error = exc
+            if not call.fall_back(error):
+                failure = error
+                status_ = _failure_status(error)
+                break
     except anyio.get_cancelled_exc_class():
         status_ = "cancelled"
         raise
@@ -162,7 +212,7 @@ async def chat_completions(
             usage.completion_tokens if usage else 0,
         )
     if failure is not None:
-        raise _provider_failed(call.provider.name, failure, headers) from failure
+        raise _provider_failed(call.attempt.provider.name, failure, headers) from failure
     response.headers.update(headers)
     return completion
 
@@ -192,32 +242,36 @@ async def _open_call(
             code="model_not_found",
             param="model",
         )
-    # The primary serves the request.
-    resolved = candidates[0]
-    provider = resolved.provider
-    price = await db.get(ModelPrice, (provider.name, resolved.upstream_model))
-    if price is None:
-        # Without a price the request can't be budgeted, so it never reaches the provider.
+    output_cap = body.output_cap(settings.default_max_tokens)
+    options = (body.model_extra or {}).get("stream_options") or {}
+    attempts = []
+    for candidate in candidates:
+        price = await db.get(ModelPrice, (candidate.provider.name, candidate.upstream_model))
+        if price is None:
+            # Without a price a provider's answer can't be billed, so it's never tried.
+            continue
+        upstream = body.for_upstream(candidate.upstream_model, output_cap, stream=body.stream)
+        if body.stream:
+            # Ask for usage in the last chunk, so the stream can be billed from real counts.
+            upstream = upstream.model_copy(
+                update={"stream_options": {**options, "include_usage": True}}
+            )
+        attempts.append(Attempt(candidate.provider, upstream, price))
+    if not attempts:
+        primary = candidates[0]
         raise OpenAIError(
             status.HTTP_400_BAD_REQUEST,
-            f"The model '{body.model}' ({provider.name}/{resolved.upstream_model}) has no "
-            "price set, so it can't be billed",
+            f"The model '{body.model}' ({primary.provider.name}/{primary.upstream_model}) has "
+            "no price set, so it can't be billed",
             code="model_not_priced",
             param="model",
         )
-    upstream = body.for_upstream(
-        resolved.upstream_model, body.output_cap(settings.default_max_tokens), stream=body.stream
-    )
-    if body.stream:
-        # Ask for usage in the last chunk, so the stream can be billed from real counts.
-        options = (body.model_extra or {}).get("stream_options") or {}
-        upstream = upstream.model_copy(
-            update={"stream_options": {**options, "include_usage": True}}
-        )
+    primary = attempts[0]
 
-    # Rate limits first: they're cheap (Redis) and keep floods off Postgres.
+    # Rate limits first: they're cheap (Redis) and keep floods off Postgres. One admission
+    # covers the request, whichever provider ends up answering it.
     # Worst case for tokens per minute: the whole prompt plus a full-length answer.
-    estimated_tokens = estimate_prompt_tokens(upstream) + upstream.max_tokens
+    estimated_tokens = estimate_prompt_tokens(primary.upstream) + output_cap
     try:
         admission = await limiter.admit(key.id, key.rpm_limit, key.tpm_limit, estimated_tokens)
     except RateLimited as exc:
@@ -225,10 +279,10 @@ async def _open_call(
 
     # Then the budget: hold the most this request could cost before spending anything.
     worst_case = cost_micros(
-        max_prompt_tokens(upstream),
-        upstream.max_tokens,
-        price.input_micros_per_1k,
-        price.output_micros_per_1k,
+        max_prompt_tokens(primary.upstream),
+        output_cap,
+        primary.price.input_micros_per_1k,
+        primary.price.output_micros_per_1k,
     )
     hold = await reserve(db, key, worst_case)
     if hold is None:
@@ -239,15 +293,13 @@ async def _open_call(
     return GatedCall(
         db=db,
         limiter=limiter,
-        provider=provider,
-        upstream=upstream,
-        price=price,
+        attempts=attempts,
         admission=admission,
         hold=hold,
         model=body.model,
         started=time.perf_counter(),
         first_token_timeout_s=settings.provider_first_token_timeout_s,
-        deadline=anyio.current_time() + settings.provider_total_timeout_s,
+        total_timeout_s=settings.provider_total_timeout_s,
     )
 
 
@@ -301,6 +353,17 @@ class OpenStream:
         self.tally = tally
         self.closed = False
 
+    async def abandon(self) -> None:
+        """Drop a stream that failed before any output, to fall back: nothing to settle."""
+        self.closed = True
+        with anyio.CancelScope(shield=True):
+            await self._stop_provider()
+
+    async def _stop_provider(self) -> None:
+        aclose = getattr(self.chunks, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
     async def close(self, status_: str) -> dict[str, str]:
         """Stop the provider's stream (no paying for tokens nobody reads), then settle, and
         return the rate limit headers. Only the first call does anything.
@@ -311,44 +374,53 @@ class OpenStream:
             return {}
         self.closed = True
         with anyio.CancelScope(shield=True):
-            aclose = getattr(self.chunks, "aclose", None)
-            if aclose is not None:
-                await aclose()
-            input_tokens, output_tokens = await self.tally.tokens(self.call.upstream)
+            await self._stop_provider()
+            input_tokens, output_tokens = await self.tally.tokens(self.call.attempt.upstream)
             return await self.call.finish(status_, input_tokens, output_tokens)
 
 
 async def _stream(call: GatedCall, body: ChatCompletionRequest) -> StreamingResponse:
     """Forward the provider's chunks as Server-Sent Events, as they arrive.
 
-    The first chunk is read before answering, so a provider that fails before any output
-    still gets a proper error status (and the hold is released). After that the status is
-    already 200: a failure mid-stream is sent as an error event, and what was generated
-    until then is billed.
+    The opening chunks are read before answering, until one carries output. Until then
+    nothing has reached the client, so a failing provider can still be swapped for the next
+    one in the route, and if none is left the client gets a proper error status (and the
+    hold is released). After that the status is already 200 and the provider is fixed: two
+    providers' answers can't be glued together, so a failure mid-stream is sent as an error
+    event, and what was generated until then is billed.
     """
     options = (body.model_extra or {}).get("stream_options") or {}
     tally = StreamTally(show_usage=bool(options.get("include_usage")))
-    stream = OpenStream(call, call.provider.stream(call.upstream), tally)
-    # Chunks up to and including the first one with output. Providers often open with a
-    # role-only chunk before generating anything, so that doesn't count as the first token.
-    opening: list[dict[str, Any]] = []
-    try:
-        with anyio.fail_after(call.first_token_time_left()):
-            while not (opening and _has_output(opening[-1])):
-                opening.append(await anext(stream.chunks))
-    except StopAsyncIteration:
-        pass
-    except TimeoutError as exc:
-        headers = await stream.close("timeout")
-        timeout = ProviderTimeout(f"{call.provider.name}: no first token in time")
-        raise _provider_failed(call.provider.name, timeout, headers) from exc
-    except ProviderError as exc:
-        headers = await stream.close(_failure_status(exc))
-        raise _provider_failed(call.provider.name, exc, headers) from exc
-    except BaseException as exc:
-        cancelled = isinstance(exc, anyio.get_cancelled_exc_class())
-        await stream.close("cancelled" if cancelled else "error")
-        raise
+    while True:
+        attempt = call.attempt
+        stream = OpenStream(call, attempt.provider.stream(attempt.upstream), tally)
+        # Chunks up to and including the first one with output. Providers often open with
+        # a role-only chunk before generating anything; that isn't the first token.
+        opening: list[dict[str, Any]] = []
+        try:
+            with anyio.fail_after(call.first_token_time_left()):
+                while not (opening and _has_output(opening[-1])):
+                    opening.append(await anext(stream.chunks))
+            break
+        except StopAsyncIteration:
+            break
+        except TimeoutError:
+            error: ProviderError = ProviderTimeout(
+                f"{attempt.provider.name}: no first token in time"
+            )
+        except ProviderError as exc:
+            error = exc
+        except BaseException as exc:
+            cancelled = isinstance(exc, anyio.get_cancelled_exc_class())
+            await stream.close("cancelled" if cancelled else "error")
+            raise
+        if call.fall_back(error):
+            # Nothing from this provider was sent or counted: drop its stream, bill nothing.
+            await stream.abandon()
+            continue
+        headers = await stream.close(_failure_status(error))
+        raise _provider_failed(attempt.provider.name, error, headers) from error
+
     # Counted now: the provider generated them, so they're billed even if never sent.
     first_events = [event for chunk in opening for event in tally.forward(chunk)]
 
@@ -380,7 +452,7 @@ async def _forward(stream: OpenStream, first_events: list[str]) -> AsyncIterator
     except (ProviderError, TimeoutError) as exc:
         timed_out = isinstance(exc, TimeoutError | ProviderTimeout)
         status_ = "timeout" if timed_out else "provider_error"
-        name = stream.call.provider.name
+        name = stream.call.attempt.provider.name
         yield _sse(
             {
                 "error": {
