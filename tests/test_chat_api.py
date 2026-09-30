@@ -5,57 +5,9 @@ from fastapi.testclient import TestClient
 from app.core.config import Settings
 from app.core.http import http_client
 from app.main import app
-from app.providers.base import ChatCompletion, ChatCompletionRequest, ProviderError
-from app.providers.catalog import Catalog, build_catalog, get_catalog
-from tests.test_admin_api import create_key
-
-MODEL = "fake/test-model"
-
-
-class FakeProvider:
-    name = "fake"
-
-    def __init__(self) -> None:
-        self.error: ProviderError | None = None
-        self.requests: list[ChatCompletionRequest] = []
-
-    async def complete(self, request: ChatCompletionRequest) -> ChatCompletion:
-        self.requests.append(request)
-        if self.error:
-            raise self.error
-        return ChatCompletion(
-            id="chatcmpl-1",
-            created=1_790_000_000,
-            model=request.model,
-            choices=[
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "Hello from fake"},
-                    "finish_reason": "stop",
-                }
-            ],
-            usage={"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
-            system_fingerprint="fp_fake",
-        )
-
-
-@pytest.fixture
-def provider(api: TestClient) -> FakeProvider:
-    fake = FakeProvider()
-    app.dependency_overrides[get_catalog] = lambda: Catalog([fake])
-    return fake
-
-
-@pytest.fixture
-def customer_key(api: TestClient) -> str:
-    return create_key(api)["key"]
-
-
-def chat(api: TestClient, key: str, **body) -> dict:
-    payload = {"model": MODEL, "messages": [{"role": "user", "content": "Hi"}]} | body
-    return api.post(
-        "/v1/chat/completions", json=payload, headers={"Authorization": f"Bearer {key}"}
-    )
+from app.providers.base import ProviderError
+from app.providers.catalog import build_catalog, get_catalog
+from tests.conftest import MODEL, chat, create_key
 
 
 def test_openai_library_works_against_tollgate(api, provider, customer_key):
@@ -190,6 +142,14 @@ def test_validation_error_does_not_echo_the_prompt(api, provider, customer_key):
     response = chat(api, customer_key, messages=[{"role": "robot", "content": "my secret prompt"}])
 
     assert "my secret prompt" not in response.text
+
+
+def test_malformed_content_part_is_not_a_server_error(api, provider, customer_key):
+    content = [{"type": "text", "text": None}, {"type": "text", "text": "Hi"}]
+
+    response = chat(api, customer_key, messages=[{"role": "user", "content": content}])
+
+    assert response.status_code == 200
 
 
 def test_unknown_model_is_404(api, provider, customer_key):

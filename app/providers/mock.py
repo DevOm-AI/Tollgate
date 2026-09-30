@@ -1,5 +1,4 @@
 import asyncio
-import math
 import random
 import time
 import uuid
@@ -7,20 +6,14 @@ from collections.abc import AsyncIterator
 from itertools import cycle, islice
 from typing import Any
 
-from app.providers.base import ChatCompletion, ChatCompletionRequest, ProviderError
+from app.providers.base import (
+    ChatCompletion,
+    ChatCompletionRequest,
+    ProviderError,
+    estimate_prompt_tokens,
+)
 
 WORDS = "tollgate checks the key the limit and the budget then forwards the request".split()
-
-
-def estimate_prompt_tokens(request: ChatCompletionRequest) -> int:
-    """About 4 characters per token, the usual rule of thumb for English text."""
-    chars = 0
-    for message in request.messages:
-        if isinstance(message.content, str):
-            chars += len(message.content)
-        elif message.content:
-            chars += sum(len(part.get("text", "")) for part in message.content)
-    return max(1, math.ceil(chars / 4))
 
 
 class MockProvider:

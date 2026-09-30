@@ -9,21 +9,7 @@ from app.core.config import Settings, get_settings
 from app.core.security import hash_api_key
 from app.main import app
 from app.models import ApiKey
-
-LIMITS = {"rpm_limit": 60, "tpm_limit": 100_000, "monthly_budget_micros": 1_000_000}
-
-
-def create_customer(api: TestClient, **body) -> dict:
-    response = api.post("/admin/customers", json={"name": "Acme"} | body)
-    assert response.status_code == 201, response.text
-    return response.json()
-
-
-def create_key(api: TestClient, **limits) -> dict:
-    customer = create_customer(api)
-    response = api.post(f"/admin/customers/{customer['id']}/keys", json=LIMITS | limits)
-    assert response.status_code == 201, response.text
-    return response.json()
+from tests.conftest import LIMITS, create_customer, create_key
 
 
 def stored_key(db_engine: Engine, key_id: str) -> ApiKey:

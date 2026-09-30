@@ -8,11 +8,11 @@ import pytest
 from pydantic import SecretStr
 
 from app.core.config import Settings
-from app.providers.base import ChatCompletionRequest, ProviderError
+from app.providers.base import ChatCompletionRequest, ProviderError, estimate_prompt_tokens
 from app.providers.catalog import Catalog, build_catalog
 from app.providers.gemini import GeminiProvider
 from app.providers.groq import GroqProvider
-from app.providers.mock import MockProvider, estimate_prompt_tokens
+from app.providers.mock import MockProvider
 
 
 def request(**overrides) -> ChatCompletionRequest:
@@ -76,6 +76,13 @@ def test_prompt_estimate_counts_text_parts():
 
     assert estimate_prompt_tokens(request(messages=[{"role": "user", "content": parts}])) == 10
     assert estimate_prompt_tokens(request(messages=[{"role": "user", "content": ""}])) == 1
+
+
+@pytest.mark.parametrize("text", [None, 5, ["a"]])
+def test_prompt_estimate_skips_parts_without_string_text(text):
+    parts = [{"type": "text", "text": text}, {"type": "text", "text": "a" * 8}]
+
+    assert estimate_prompt_tokens(request(messages=[{"role": "user", "content": parts}])) == 2
 
 
 def test_mock_waits_for_its_delay():
