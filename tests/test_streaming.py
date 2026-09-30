@@ -330,8 +330,13 @@ def test_client_disconnect_stops_the_provider_and_bills_what_was_generated(
 
 
 def call_asgi_with_hang_up(key: str, *, hang_up_by: str) -> None:
-    """POST a stream straight to the app as an ASGI 2.4 server would, and hang up after the
-    first word: either the next send fails (OSError) or an http.disconnect arrives."""
+    """POST a stream straight to the app as an ASGI 2.4 server would, and hang up:
+
+    - failed_send: after the first word, the next send fails (OSError)
+    - disconnect: after the first word, an http.disconnect arrives
+    - failed_start: sending the response start fails, before any body is sent
+    - early_disconnect: the client is gone before the first body chunk
+    """
     body = json.dumps(
         {"model": MODEL, "messages": [{"role": "user", "content": "Hi"}], "stream": True}
     ).encode()
@@ -363,12 +368,16 @@ def call_asgi_with_hang_up(key: str, *, hang_up_by: str) -> None:
             if not request_read:
                 request_read = True
                 return {"type": "http.request", "body": body, "more_body": False}
+            if hang_up_by == "early_disconnect":
+                return {"type": "http.disconnect"}
             if hang_up_by == "disconnect":
                 await first_word_sent.wait()
                 return {"type": "http.disconnect"}
             await anyio.sleep_forever()
 
         async def send(message: dict) -> None:
+            if hang_up_by == "failed_start" and message["type"] == "http.response.start":
+                raise OSError("connection reset by peer")
             if first_word_sent.is_set() and hang_up_by == "failed_send":
                 raise OSError("connection reset by peer")
             if message["type"] == "http.response.body" and b'"content"' in message["body"]:
@@ -392,3 +401,20 @@ def test_hang_up_stops_the_provider_under_asgi_2_4(api, provider, db_engine, han
     assert not provider.stream_completed
     assert provider.streamed_chunks < len(STREAM_WORDS)
     assert spend(db_engine, created["id"])[1] == 0
+
+
+@pytest.mark.parametrize("hang_up_by", ["failed_start", "early_disconnect"])
+def test_hang_up_before_the_first_chunk_is_sent_still_settles(api, provider, db_engine, hang_up_by):
+    # failed_start is the case where the forwarding generator never starts, so only the
+    # response's fallback can settle it; early_disconnect usually races just past that.
+    created = create_key(api)
+    provider.chunk_delay_s = 0.3
+
+    call_asgi_with_hang_up(created["key"], hang_up_by=hang_up_by)
+
+    request = logged(db_engine, created["id"])
+    assert request.status == "cancelled"
+    # The provider had generated its first word, so that's billed; nothing is left held.
+    assert request.output_tokens == count_text_tokens(STREAM_WORDS[0])
+    assert spend(db_engine, created["id"])[1] == 0
+    assert not provider.stream_completed

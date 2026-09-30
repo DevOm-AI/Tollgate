@@ -1,6 +1,6 @@
 import json
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Annotated, Any
 
@@ -234,9 +234,16 @@ class HangUpAwareStreamingResponse(StreamingResponse):
 
     Starlette only watches for the disconnect under ASGI spec < 2.4; from 2.4 it waits for a
     send to fail and leaves the generator open, so the provider would keep generating (and
-    Tollgate paying) for nobody. This watches under every spec and always closes the
-    generator, which stops the provider's stream and settles what was generated.
+    Tollgate paying) for nobody. This watches under every spec, always closes the generator,
+    and then calls `on_close`: closing a generator that never started runs none of its
+    code, so `on_close` is what settles a stream that ends before its first chunk is sent.
     """
+
+    def __init__(
+        self, content: AsyncIterator[str], on_close: Callable[[], Awaitable[object]], **kwargs
+    ) -> None:
+        super().__init__(content, **kwargs)
+        self.on_close = on_close
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
@@ -254,6 +261,35 @@ class HangUpAwareStreamingResponse(StreamingResponse):
         finally:
             with anyio.CancelScope(shield=True):
                 await self.body_iterator.aclose()
+                await self.on_close()
+
+
+class OpenStream:
+    """A provider stream that's being forwarded, and the one place it's closed and settled."""
+
+    def __init__(
+        self, call: GatedCall, chunks: AsyncIterator[dict[str, Any]], tally: "StreamTally"
+    ):
+        self.call = call
+        self.chunks = chunks
+        self.tally = tally
+        self.closed = False
+
+    async def close(self, status_: str) -> dict[str, str]:
+        """Stop the provider's stream (no paying for tokens nobody reads), then settle, and
+        return the rate limit headers. Only the first call does anything.
+
+        Shielded throughout: counting and settling must finish even if the client is gone.
+        """
+        if self.closed:
+            return {}
+        self.closed = True
+        with anyio.CancelScope(shield=True):
+            aclose = getattr(self.chunks, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            input_tokens, output_tokens = await self.tally.tokens(self.call.upstream)
+            return await self.call.finish(status_, input_tokens, output_tokens)
 
 
 async def _stream(call: GatedCall, body: ChatCompletionRequest) -> StreamingResponse:
@@ -266,41 +302,36 @@ async def _stream(call: GatedCall, body: ChatCompletionRequest) -> StreamingResp
     """
     options = (body.model_extra or {}).get("stream_options") or {}
     tally = StreamTally(show_usage=bool(options.get("include_usage")))
-    chunks = call.provider.stream(call.upstream)
-    first: dict[str, Any] | None = None
-    status_ = "error"
+    stream = OpenStream(call, call.provider.stream(call.upstream), tally)
     try:
-        first = await anext(chunks)
+        first = await anext(stream.chunks)
     except StopAsyncIteration:
-        pass
+        first = None
     except ProviderError as exc:
-        headers = await _close_stream(call, chunks, tally, "provider_error")
+        headers = await stream.close("provider_error")
         raise _provider_failed(call.provider.name, exc, headers) from exc
     except BaseException as exc:
-        status_ = "cancelled" if isinstance(exc, anyio.get_cancelled_exc_class()) else "error"
-        await _close_stream(call, chunks, tally, status_)
+        cancelled = isinstance(exc, anyio.get_cancelled_exc_class())
+        await stream.close("cancelled" if cancelled else "error")
         raise
+    # Counted now: the provider generated it, so it's billed even if it's never sent.
+    first_events = tally.forward(first) if first is not None else []
 
     return HangUpAwareStreamingResponse(
-        _forward(call, first, chunks, tally),
+        _forward(stream, first_events),
+        on_close=lambda: stream.close("cancelled"),
         media_type="text/event-stream",
         headers=rate_limit_headers(call.admission.requests, call.admission.tokens) | STREAM_HEADERS,
     )
 
 
-async def _forward(
-    call: GatedCall,
-    first: dict[str, Any] | None,
-    chunks: AsyncIterator[dict[str, Any]],
-    tally: "StreamTally",
-) -> AsyncIterator[str]:
+async def _forward(stream: OpenStream, first_events: list[str]) -> AsyncIterator[str]:
     status_ = "error"  # Anything unexpected, until known otherwise.
     try:
-        if first is not None:
-            for event in tally.forward(first):
-                yield event
-        async for chunk in chunks:
-            for event in tally.forward(chunk):
+        for event in first_events:
+            yield event
+        async for chunk in stream.chunks:
+            for event in stream.tally.forward(chunk):
                 yield event
         status_ = "ok"
         yield "data: [DONE]\n\n"
@@ -309,7 +340,7 @@ async def _forward(
         yield _sse(
             {
                 "error": {
-                    "message": f"The provider '{call.provider.name}' failed mid-answer",
+                    "message": f"The provider '{stream.call.provider.name}' failed mid-answer",
                     "type": "api_error",
                     "param": None,
                     "code": "provider_error",
@@ -320,22 +351,7 @@ async def _forward(
         status_ = "cancelled"  # The client hung up.
         raise
     finally:
-        await _close_stream(call, chunks, tally, status_)
-
-
-async def _close_stream(
-    call: GatedCall, chunks: AsyncIterator[dict[str, Any]], tally: "StreamTally", status_: str
-) -> dict[str, str]:
-    """Stop the provider's stream (no paying for tokens nobody reads), then settle.
-
-    Shielded throughout: counting and settling must finish even if the client is gone.
-    """
-    with anyio.CancelScope(shield=True):
-        aclose = getattr(chunks, "aclose", None)
-        if aclose is not None:
-            await aclose()
-        input_tokens, output_tokens = await tally.tokens(call.upstream)
-        return await call.finish(status_, input_tokens, output_tokens)
+        await stream.close(status_)
 
 
 class StreamTally:
