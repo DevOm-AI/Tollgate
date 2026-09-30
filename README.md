@@ -162,6 +162,39 @@ hardware (needs Docker for k6):
 uv run python -m loadtest.overhead --vus 1 --duration 20s
 ```
 
+## The crash test
+
+What happens to the money if Tollgate dies mid-request? A real server answers 100 requests,
+then gets `SIGKILL` while 200 slow requests hold budget reservations. After a restart (with
+time fast-forwarded in the database instead of waiting 10 minutes) the real jobs run: the
+sweep releases the leaked reservations and the outbox pushes usage to Stripe (a fake Stripe
+here, with Stripe's duplicate-identifier behaviour). Then the push is replayed, as if Tollgate
+crashed again after Stripe said OK but before marking the rows sent:
+
+| | |
+| --- | --- |
+| Requests answered (100 before the crash, 1 after) | 101 |
+| Requests in flight when the server was killed | 200 |
+| Reservations left open by the crash | 200 |
+| Money held by them | $0.082200 |
+| Reservations released by the sweep | 200 |
+| Held after the sweep | $0.000000 |
+| Spent (key_spend) | $0.001313 |
+| Cost of the answered requests (request log) | $0.001313 |
+| Usage recorded for Stripe (outbox) | $0.001313 |
+| Usage in Stripe after the push | $0.001313 |
+| Usage in Stripe after replaying the push | $0.001313 |
+| Meter events Stripe kept / sent | 1 / 2 |
+| Served requests after restart | yes |
+
+The killed requests are billed nothing and release everything they held; spend, the request
+log, the outbox and Stripe all agree on what the answered requests cost; and the replayed
+push is dropped by Stripe as a duplicate.
+
+```bash
+uv run python -m loadtest.crash
+```
+
 ## Budgets
 
 Each key has a monthly budget (`monthly_budget_micros`, in micro-dollars: 1 USD = 1,000,000).
