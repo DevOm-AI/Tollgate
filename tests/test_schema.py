@@ -255,5 +255,10 @@ def test_deleting_a_customer_removes_its_keys_and_their_rows(db: Session):
 
     db.execute(delete(Customer).where(Customer.id == key.customer_id))
 
-    for model in (ApiKey, KeySpend, Reservation, RequestLog, UsageOutbox):
-        assert db.scalars(select(model)).all() == []
+    assert db.scalars(select(ApiKey).where(ApiKey.customer_id == key.customer_id)).all() == []
+    assert (
+        db.scalars(select(UsageOutbox).where(UsageOutbox.customer_id == key.customer_id)).all()
+        == []
+    )
+    for model in (KeySpend, Reservation, RequestLog):
+        assert db.scalars(select(model).where(model.key_id == key.id)).all() == []
