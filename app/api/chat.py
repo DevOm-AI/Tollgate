@@ -1,7 +1,6 @@
-import math
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Response, status
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,7 +9,13 @@ from app.api.errors import OpenAIError
 from app.core.config import Settings, get_settings
 from app.core.db import get_db
 from app.core.security import bearer, hash_api_key
-from app.limits.rate_limit import RateLimited, RateLimiter, get_rate_limiter
+from app.limits.rate_limit import (
+    RateLimited,
+    RateLimiter,
+    get_rate_limiter,
+    rate_limit_headers,
+    retry_after,
+)
 from app.models import ApiKey
 from app.providers.base import (
     ChatCompletion,
@@ -50,6 +55,7 @@ def _invalid_key(message: str) -> OpenAIError:
 @router.post("/chat/completions")
 async def chat_completions(
     body: ChatCompletionRequest,
+    response: Response,
     key: Annotated[ApiKey, Depends(require_customer_key)],
     catalog: Annotated[Catalog, Depends(get_catalog)],
     settings: Annotated[Settings, Depends(get_settings)],
@@ -80,31 +86,41 @@ async def chat_completions(
     # A failed call used no tokens, so the whole estimate goes back.
     actual_tokens = 0
     try:
-        completion = await provider.complete(upstream)
-        actual_tokens = completion.usage.total_tokens
-        return completion
+        try:
+            completion = await provider.complete(upstream)
+            actual_tokens = completion.usage.total_tokens
+        finally:
+            tokens = await limiter.settle(admission, actual_tokens)
+            headers = rate_limit_headers(admission.requests, tokens)
     except ProviderError as exc:
-        raise _provider_failed(provider.name, exc) from exc
-    finally:
-        await limiter.settle(admission, actual_tokens)
+        raise _provider_failed(provider.name, exc, headers) from exc
+    response.headers.update(headers)
+    return completion
 
 
 def _rate_limited(exc: RateLimited) -> OpenAIError:
     limit = exc.result.limit
-    if exc.result.retry_after_ms is None:
+    headers = rate_limit_headers(exc.requests, exc.tokens)
+    wait = retry_after(exc)
+    if wait is None:
+        # Retrying can't help, so there's no Retry-After.
         message = (
             f"Request too large: it may use up to {exc.cost} tokens, but the limit is {limit} "
             "tokens per minute. Lower max_tokens or shorten the prompt."
         )
     else:
-        wait = math.ceil(exc.result.retry_after_ms / 1000)
+        headers["Retry-After"] = str(wait)
         message = f"Rate limit reached: {limit} {exc.limit} per minute. Try again in {wait}s."
     return OpenAIError(
-        status.HTTP_429_TOO_MANY_REQUESTS, message, type=exc.limit, code="rate_limit_exceeded"
+        status.HTTP_429_TOO_MANY_REQUESTS,
+        message,
+        type=exc.limit,
+        code="rate_limit_exceeded",
+        headers=headers,
     )
 
 
-def _provider_failed(provider: str, exc: ProviderError) -> OpenAIError:
+def _provider_failed(provider: str, exc: ProviderError, headers: dict[str, str]) -> OpenAIError:
     if exc.is_client_error:
         # The provider rejected the request itself (e.g. an unknown model); its reason helps
         # the caller fix it, and goes only to the caller that sent the request.
@@ -113,10 +129,12 @@ def _provider_failed(provider: str, exc: ProviderError) -> OpenAIError:
             status.HTTP_400_BAD_REQUEST,
             f"The provider '{provider}' rejected the request{detail}",
             code="provider_rejected_request",
+            headers=headers,
         )
     return OpenAIError(
         status.HTTP_502_BAD_GATEWAY,
         f"The provider '{provider}' failed to answer",
         type="api_error",
         code="provider_error",
+        headers=headers,
     )

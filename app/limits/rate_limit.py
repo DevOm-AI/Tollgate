@@ -1,3 +1,4 @@
+import math
 import uuid
 from dataclasses import dataclass
 from typing import Annotated, Literal
@@ -12,13 +13,25 @@ LimitName = Literal["requests", "tokens"]
 
 
 class RateLimited(Exception):
-    """A key's per-minute limit is used up. `result` says when it has room again."""
+    """A key's per-minute limit is used up.
 
-    def __init__(self, limit: LimitName, result: TakeResult, cost: int) -> None:
+    `limit` names the one that refused; `requests` and `tokens` are both buckets as they are
+    now, so the response can report them.
+    """
+
+    def __init__(
+        self, limit: LimitName, requests: TakeResult, tokens: TakeResult, cost: int
+    ) -> None:
         super().__init__(f"{limit} per minute limit reached")
         self.limit = limit
-        self.result = result
+        self.requests = requests
+        self.tokens = tokens
         self.cost = cost
+
+    @property
+    def result(self) -> TakeResult:
+        """The bucket that refused."""
+        return self.requests if self.limit == "requests" else self.tokens
 
 
 @dataclass(frozen=True)
@@ -46,14 +59,21 @@ class RateLimiter:
         self, key_id: uuid.UUID, rpm_limit: int, tpm_limit: int, estimated_tokens: int
     ) -> Admission:
         """Take 1 request and the estimate, or raise RateLimited having taken neither."""
+        if estimated_tokens > tpm_limit:
+            # Can never fit, whatever the requests bucket says: report that, not a wait.
+            requests = await self._bucket.take(f"{key_id}:rpm", rpm_limit, 0)
+            tokens = await self._bucket.take(f"{key_id}:tpm", tpm_limit, estimated_tokens)
+            raise RateLimited("tokens", requests, tokens, cost=estimated_tokens)
         requests = await self._bucket.take(f"{key_id}:rpm", rpm_limit)
         if not requests.allowed:
-            raise RateLimited("requests", requests, cost=1)
+            # Taking 0 reads the tokens bucket without changing it.
+            tokens = await self._bucket.take(f"{key_id}:tpm", tpm_limit, 0)
+            raise RateLimited("requests", requests, tokens, cost=1)
         tokens = await self._bucket.take(f"{key_id}:tpm", tpm_limit, estimated_tokens)
         if not tokens.allowed:
             # The request doesn't go ahead, so it doesn't count against requests either.
-            await self._bucket.adjust(f"{key_id}:rpm", rpm_limit, 1)
-            raise RateLimited("tokens", tokens, cost=estimated_tokens)
+            requests = await self._bucket.adjust(f"{key_id}:rpm", rpm_limit, 1)
+            raise RateLimited("tokens", requests, tokens, cost=estimated_tokens)
         return Admission(key_id, tpm_limit, estimated_tokens, requests, tokens)
 
     async def settle(self, admission: Admission, actual_tokens: int) -> TakeResult:
@@ -63,6 +83,26 @@ class RateLimiter:
             admission.tpm_limit,
             admission.estimated_tokens - actual_tokens,
         )
+
+
+def rate_limit_headers(requests: TakeResult, tokens: TakeResult) -> dict[str, str]:
+    """Both limits, as OpenAI reports them. Reset is whole seconds until the bucket is full."""
+    headers = {}
+    for suffix, result in (("Requests", requests), ("Tokens", tokens)):
+        headers[f"X-RateLimit-Limit-{suffix}"] = str(result.limit)
+        headers[f"X-RateLimit-Remaining-{suffix}"] = str(result.remaining)
+        headers[f"X-RateLimit-Reset-{suffix}"] = str(_seconds(result.reset_ms))
+    return headers
+
+
+def retry_after(exc: RateLimited) -> int | None:
+    """Whole seconds until the refused request could pass; None if it never can."""
+    ms = exc.result.retry_after_ms
+    return None if ms is None else max(1, _seconds(ms))
+
+
+def _seconds(ms: int) -> int:
+    return math.ceil(ms / 1000)
 
 
 def get_rate_limiter(redis: Annotated[Redis, Depends(get_redis)]) -> RateLimiter:
