@@ -24,8 +24,9 @@ is a burst of traffic that was paid for anyway.
 
 - During an outage a key can exceed its per-minute limits, and so can hit the provider harder;
   the provider's own rate limits and Tollgate's budget still apply.
-- If Redis hangs rather than refuses connections, each request waits up to the 2 s connect
-  timeout before going ahead.
+- If Redis hangs rather than refuses connections, requests slow down: each Redis call gives
+  up after 2 s (connect and read timeouts), and a request can hit that once when admitted
+  and once when settled, so it can be delayed by up to about 4 s before going ahead.
 - Tokens taken just before Redis failed aren't settled, so the key's tokens bucket may stay a
   little lower than it should for up to a minute after Redis returns. That errs strict.
 - An oversized request (estimate above the whole tokens-per-minute limit) is let through too,
