@@ -45,6 +45,8 @@ for chunk in client.chat.completions.create(
 
 Tollgate asks the provider for token usage at the end of every stream and bills from it
 (passing it on only if you ask with `stream_options={"include_usage": True}`). If a provider
+doesn't send usage, Tollgate counts the prompt and the streamed answer itself with a tokenizer
+(`cl100k_base`, baked into the Docker image), never billing more output than `max_tokens`. If a provider
 fails before sending anything you get a normal error; if it fails mid-answer the stream ends
 with an error event and you're billed for what was sent.
 
