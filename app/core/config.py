@@ -7,6 +7,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Prefixes of Stripe keys that move real money.
 STRIPE_LIVE_KEY_PREFIXES = ("sk_live_", "rk_live_")
 
+# Route name -> models to try, in order: "<provider>/<model>" or "mock". Customers ask for the
+# route; Tollgate picks the provider. Targets whose provider has no API key are skipped.
+DEFAULT_ROUTES: dict[str, list[str]] = {
+    "fast-chat": ["groq/llama-3.1-8b-instant", "gemini/gemini-2.5-flash"],
+}
+
 # Customer keys start with this; the admin key must not look like one.
 CUSTOMER_KEY_PREFIX = "tg_live_"
 ADMIN_API_KEY_MIN_LENGTH = 32
@@ -56,6 +62,10 @@ class Settings(BaseSettings):
     provider_first_token_timeout_s: float = Field(default=30.0, gt=0)
     provider_total_timeout_s: float = Field(default=120.0, gt=0)
 
+    # Routes (see DEFAULT_ROUTES). From the environment as JSON:
+    # ROUTES='{"fast-chat": ["groq/llama-3.1-8b-instant", "gemini/gemini-2.5-flash"]}'
+    routes: dict[str, list[str]] = Field(default_factory=lambda: dict(DEFAULT_ROUTES))
+
     # The mock provider (model "mock"): fake answers that cost nothing, for tests and demos.
     mock_delay_ms: int = Field(default=0, ge=0)
     mock_output_tokens: int = Field(default=32, gt=0)
@@ -85,6 +95,23 @@ class Settings(BaseSettings):
         if secret.startswith(CUSTOMER_KEY_PREFIX):
             raise ValueError("ADMIN_API_KEY must not be a customer key")
         return value
+
+    @field_validator("routes")
+    @classmethod
+    def _check_routes(cls, routes: dict[str, list[str]]) -> dict[str, list[str]]:
+        for name, targets in routes.items():
+            # A route name must not look like a model, or it would hide one.
+            if not name or "/" in name or name == "mock":
+                raise ValueError(f"route name {name!r} must not be empty, 'mock' or contain '/'")
+            if not targets:
+                raise ValueError(f"route {name!r} needs at least one model")
+            for target in targets:
+                # Models only, not other routes: routes never chain or loop.
+                if target != "mock" and "/" not in target:
+                    raise ValueError(
+                        f"route {name!r}: {target!r} must be 'mock' or '<provider>/<model>'"
+                    )
+        return routes
 
     @model_validator(mode="after")
     def _refuse_live_stripe_key(self) -> "Settings":

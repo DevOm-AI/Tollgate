@@ -176,21 +176,32 @@ async def _open_call(
     limiter: RateLimiter,
 ) -> GatedCall:
     """Find the provider and price, then pass the rate limits and reserve the budget."""
-    resolved = catalog.resolve(body.model)
-    if resolved is None:
+    candidates = catalog.candidates(body.model)
+    if not candidates:
+        if catalog.is_route(body.model):
+            raise OpenAIError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                f"No provider for '{body.model}' is set up right now",
+                type="api_error",
+                code="model_unavailable",
+                param="model",
+            )
         raise OpenAIError(
             status.HTTP_404_NOT_FOUND,
             f"The model '{body.model}' does not exist",
             code="model_not_found",
             param="model",
         )
+    # The primary serves the request.
+    resolved = candidates[0]
     provider = resolved.provider
     price = await db.get(ModelPrice, (provider.name, resolved.upstream_model))
     if price is None:
         # Without a price the request can't be budgeted, so it never reaches the provider.
         raise OpenAIError(
             status.HTTP_400_BAD_REQUEST,
-            f"The model '{body.model}' has no price set, so it can't be billed",
+            f"The model '{body.model}' ({provider.name}/{resolved.upstream_model}) has no "
+            "price set, so it can't be billed",
             code="model_not_priced",
             param="model",
         )
