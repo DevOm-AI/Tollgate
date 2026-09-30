@@ -13,14 +13,18 @@ from redis.asyncio import Redis
 # ARGV[3]  cost: tokens this request takes
 # ARGV[4]  now in ms, from the app's clock (not Redis TIME, which some hosted Redis builds
 #          don't allow in scripts)
+# ARGV[5]  "take": take `cost` only if the bucket has it.
+#          "adjust": take `cost` regardless (negative gives tokens back). The bucket may go
+#          below zero, which makes the key wait longer; it never goes above capacity.
 #
-# Returns {allowed (1/0), tokens left (whole), ms until `cost` tokens are there (-1 if never),
-#          ms until the bucket is full again}.
-TAKE_SCRIPT = """
+# Returns {allowed (1/0), tokens left (whole, at least 0), ms until `cost` tokens are there
+#          (-1 if never), ms until the bucket is full again}.
+BUCKET_SCRIPT = """
 local capacity = tonumber(ARGV[1])
 local period_ms = tonumber(ARGV[2])
 local cost = tonumber(ARGV[3])
 local now = tonumber(ARGV[4])
+local mode = ARGV[5]
 
 local bucket = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
 local tokens = tonumber(bucket[1]) or capacity
@@ -32,7 +36,10 @@ local elapsed = math.max(0, now - ts)
 tokens = math.min(capacity, tokens + elapsed * capacity / period_ms)
 
 local allowed = 0
-if tokens >= cost then
+if mode == 'adjust' then
+  tokens = math.min(capacity, tokens - cost)
+  allowed = 1
+elseif tokens >= cost then
   tokens = tokens - cost
   allowed = 1
 end
@@ -51,7 +58,7 @@ redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', tostring(math.max(
 -- Once full, the bucket is the same as a missing one: let Redis drop it.
 redis.call('PEXPIRE', KEYS[1], math.max(reset_ms, 1))
 
-return {allowed, math.floor(tokens), retry_ms, reset_ms}
+return {allowed, math.max(0, math.floor(tokens)), retry_ms, reset_ms}
 """
 
 KEY_PREFIX = "tg:bucket:"
@@ -84,17 +91,26 @@ class TokenBucket:
         period_ms: int = MINUTE_MS,
         clock: Callable[[], int] = _now_ms,
     ) -> None:
-        self._script = redis.register_script(TAKE_SCRIPT)
+        self._script = redis.register_script(BUCKET_SCRIPT)
         self._period_ms = period_ms
         self._clock = clock
 
     async def take(self, name: str, capacity: int, cost: int = 1) -> TakeResult:
         """Take `cost` tokens from bucket `name` if it has them. Nothing is taken otherwise."""
-        if capacity <= 0 or cost < 0:
-            raise ValueError("capacity must be positive and cost not negative")
+        if cost < 0:
+            raise ValueError("cost must not be negative")
+        return await self._run(name, capacity, cost, "take")
+
+    async def adjust(self, name: str, capacity: int, tokens: int) -> TakeResult:
+        """Give `tokens` back to bucket `name` (up to capacity), or take -`tokens` regardless."""
+        return await self._run(name, capacity, -tokens, "adjust")
+
+    async def _run(self, name: str, capacity: int, cost: int, mode: str) -> TakeResult:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
         allowed, remaining, retry_ms, reset_ms = await self._script(
             keys=[KEY_PREFIX + name],
-            args=[capacity, self._period_ms, cost, self._clock()],
+            args=[capacity, self._period_ms, cost, self._clock(), mode],
         )
         return TakeResult(
             allowed=bool(allowed),

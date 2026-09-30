@@ -8,11 +8,11 @@ import pytest
 from pydantic import SecretStr
 
 from app.core.config import Settings
-from app.providers.base import ChatCompletionRequest, ProviderError
+from app.providers.base import ChatCompletionRequest, ProviderError, estimate_prompt_tokens
 from app.providers.catalog import Catalog, build_catalog
 from app.providers.gemini import GeminiProvider
 from app.providers.groq import GroqProvider
-from app.providers.mock import MockProvider, estimate_prompt_tokens
+from app.providers.mock import MockProvider
 
 
 def request(**overrides) -> ChatCompletionRequest:

@@ -1,3 +1,4 @@
+import math
 from collections.abc import AsyncIterator
 from typing import Any, Literal, Protocol, Self
 
@@ -40,6 +41,17 @@ class ChatCompletionRequest(BaseModel):
                 "stream": stream,
             }
         )
+
+
+def estimate_prompt_tokens(request: ChatCompletionRequest) -> int:
+    """A rough input token count: about 4 characters per token, the rule of thumb for English."""
+    chars = 0
+    for message in request.messages:
+        if isinstance(message.content, str):
+            chars += len(message.content)
+        elif message.content:
+            chars += sum(len(part.get("text", "")) for part in message.content)
+    return max(1, math.ceil(chars / 4))
 
 
 class Usage(BaseModel):

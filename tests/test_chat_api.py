@@ -5,57 +5,9 @@ from fastapi.testclient import TestClient
 from app.core.config import Settings
 from app.core.http import http_client
 from app.main import app
-from app.providers.base import ChatCompletion, ChatCompletionRequest, ProviderError
-from app.providers.catalog import Catalog, build_catalog, get_catalog
-from tests.test_admin_api import create_key
-
-MODEL = "fake/test-model"
-
-
-class FakeProvider:
-    name = "fake"
-
-    def __init__(self) -> None:
-        self.error: ProviderError | None = None
-        self.requests: list[ChatCompletionRequest] = []
-
-    async def complete(self, request: ChatCompletionRequest) -> ChatCompletion:
-        self.requests.append(request)
-        if self.error:
-            raise self.error
-        return ChatCompletion(
-            id="chatcmpl-1",
-            created=1_790_000_000,
-            model=request.model,
-            choices=[
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "Hello from fake"},
-                    "finish_reason": "stop",
-                }
-            ],
-            usage={"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
-            system_fingerprint="fp_fake",
-        )
-
-
-@pytest.fixture
-def provider(api: TestClient) -> FakeProvider:
-    fake = FakeProvider()
-    app.dependency_overrides[get_catalog] = lambda: Catalog([fake])
-    return fake
-
-
-@pytest.fixture
-def customer_key(api: TestClient) -> str:
-    return create_key(api)["key"]
-
-
-def chat(api: TestClient, key: str, **body) -> dict:
-    payload = {"model": MODEL, "messages": [{"role": "user", "content": "Hi"}]} | body
-    return api.post(
-        "/v1/chat/completions", json=payload, headers={"Authorization": f"Bearer {key}"}
-    )
+from app.providers.base import ProviderError
+from app.providers.catalog import build_catalog, get_catalog
+from tests.conftest import MODEL, chat, create_key
 
 
 def test_openai_library_works_against_tollgate(api, provider, customer_key):

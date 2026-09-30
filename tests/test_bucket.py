@@ -170,6 +170,35 @@ def test_buckets_are_separate():
     run(test)
 
 
+def test_adjust_gives_tokens_back_up_to_capacity():
+    async def test(bucket, name, clock, redis):
+        await bucket.take(name, capacity=10, cost=8)
+
+        given = await bucket.adjust(name, capacity=10, tokens=5)
+        capped = await bucket.adjust(name, capacity=10, tokens=50)
+
+        assert given.remaining == 7
+        assert capped.remaining == 10
+
+    run(test)
+
+
+def test_adjust_can_take_more_than_is_left():
+    async def test(bucket, name, clock, redis):
+        await bucket.take(name, capacity=60, cost=60)
+
+        charged = await bucket.adjust(name, capacity=60, tokens=-30)
+
+        assert charged.remaining == 0
+        # 30 below zero: 30 s to get back to zero, then 1 s for one token.
+        clock.advance(30_000)
+        assert not (await bucket.take(name, capacity=60)).allowed
+        clock.advance(1_000)
+        assert (await bucket.take(name, capacity=60)).allowed
+
+    run(test)
+
+
 @pytest.mark.parametrize(("capacity", "cost"), [(0, 1), (5, -1)])
 def test_invalid_capacity_or_cost_is_refused(capacity: int, cost: int):
     async def test(bucket, name, clock, redis):

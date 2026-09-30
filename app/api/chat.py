@@ -1,3 +1,4 @@
+import math
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, status
@@ -9,8 +10,14 @@ from app.api.errors import OpenAIError
 from app.core.config import Settings, get_settings
 from app.core.db import get_db
 from app.core.security import bearer, hash_api_key
+from app.limits.rate_limit import RateLimited, RateLimiter, get_rate_limiter
 from app.models import ApiKey
-from app.providers.base import ChatCompletion, ChatCompletionRequest, ProviderError
+from app.providers.base import (
+    ChatCompletion,
+    ChatCompletionRequest,
+    ProviderError,
+    estimate_prompt_tokens,
+)
 from app.providers.catalog import Catalog, get_catalog
 
 router = APIRouter(prefix="/v1", tags=["openai"])
@@ -46,6 +53,7 @@ async def chat_completions(
     key: Annotated[ApiKey, Depends(require_customer_key)],
     catalog: Annotated[Catalog, Depends(get_catalog)],
     settings: Annotated[Settings, Depends(get_settings)],
+    limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
 ) -> ChatCompletion:
     """Same request and response as OpenAI's POST /v1/chat/completions."""
     if body.stream:
@@ -62,10 +70,38 @@ async def chat_completions(
     upstream = body.for_upstream(
         resolved.upstream_model, body.output_cap(settings.default_max_tokens), stream=False
     )
+    # Worst case for tokens per minute: the whole prompt plus a full-length answer.
+    estimated_tokens = estimate_prompt_tokens(upstream) + upstream.max_tokens
     try:
-        return await provider.complete(upstream)
+        admission = await limiter.admit(key.id, key.rpm_limit, key.tpm_limit, estimated_tokens)
+    except RateLimited as exc:
+        raise _rate_limited(exc) from exc
+
+    # A failed call used no tokens, so the whole estimate goes back.
+    actual_tokens = 0
+    try:
+        completion = await provider.complete(upstream)
+        actual_tokens = completion.usage.total_tokens
+        return completion
     except ProviderError as exc:
         raise _provider_failed(provider.name, exc) from exc
+    finally:
+        await limiter.settle(admission, actual_tokens)
+
+
+def _rate_limited(exc: RateLimited) -> OpenAIError:
+    limit = exc.result.limit
+    if exc.result.retry_after_ms is None:
+        message = (
+            f"Request too large: it may use up to {exc.cost} tokens, but the limit is {limit} "
+            "tokens per minute. Lower max_tokens or shorten the prompt."
+        )
+    else:
+        wait = math.ceil(exc.result.retry_after_ms / 1000)
+        message = f"Rate limit reached: {limit} {exc.limit} per minute. Try again in {wait}s."
+    return OpenAIError(
+        status.HTTP_429_TOO_MANY_REQUESTS, message, type=exc.limit, code="rate_limit_exceeded"
+    )
 
 
 def _provider_failed(provider: str, exc: ProviderError) -> OpenAIError:
