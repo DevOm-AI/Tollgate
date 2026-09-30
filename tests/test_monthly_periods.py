@@ -6,6 +6,7 @@ from sqlalchemy import Engine, pool, select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import Session
 
+from app.billing import budget
 from app.billing.budget import Outcome, reserve, settle
 from app.models import ApiKey, Customer, KeySpend
 
@@ -80,14 +81,16 @@ def test_new_month_starts_with_the_full_budget(db_engine):
     assert periods(db_engine, key_id) == {"2026-09": (BUDGET, 0), "2026-10": (BUDGET, 0)}
 
 
-def test_request_straddling_the_month_settles_in_the_month_it_reserved(db_engine):
+def test_request_straddling_the_month_settles_in_the_month_it_reserved(db_engine, monkeypatch):
     key_id = make_key(db_engine)
 
     async def job(engine):
         async with AsyncSession(engine, expire_on_commit=False) as db:
             key = await db.get(ApiKey, key_id)
             hold = await reserve(db, key, 500, now=SEPT_LAST_SECOND)
-            # The answer arrives after midnight: October has already begun.
+            # The answer arrives after midnight: October has already begun, for any code
+            # that asks the clock (settle must use the hold's month instead).
+            monkeypatch.setattr(budget, "current_period", lambda now=None: "2026-10")
             await reserve(db, key, 1, now=OCT_FIRST_SECOND)
             await settle(db, hold, 300, Outcome(model="m", provider="fake", status="ok"))
 
