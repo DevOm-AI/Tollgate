@@ -1,5 +1,4 @@
 import json
-import math
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -35,6 +34,7 @@ from app.providers.base import (
     estimate_prompt_tokens,
 )
 from app.providers.catalog import Catalog, get_catalog
+from app.providers.tokens import count_usage
 
 router = APIRouter(prefix="/v1", tags=["openai"])
 
@@ -298,13 +298,16 @@ async def _forward(
 async def _close_stream(
     call: GatedCall, chunks: AsyncIterator[dict[str, Any]], tally: "StreamTally", status_: str
 ) -> dict[str, str]:
-    """Stop the provider's stream (no paying for tokens nobody reads), then settle."""
+    """Stop the provider's stream (no paying for tokens nobody reads), then settle.
+
+    Shielded throughout: counting and settling must finish even if the client is gone.
+    """
     with anyio.CancelScope(shield=True):
         aclose = getattr(chunks, "aclose", None)
         if aclose is not None:
             await aclose()
-    input_tokens, output_tokens = tally.tokens(call.upstream)
-    return await call.finish(status_, input_tokens, output_tokens)
+        input_tokens, output_tokens = await tally.tokens(call.upstream)
+        return await call.finish(status_, input_tokens, output_tokens)
 
 
 class StreamTally:
@@ -314,7 +317,7 @@ class StreamTally:
         # Usage is always requested from the provider; the client only sees it if it asked.
         self.show_usage = show_usage
         self.usage: dict[str, Any] | None = None
-        self.output_chars = 0
+        self.output: list[str] = []
 
     def forward(self, chunk: dict[str, Any]) -> list[str]:
         if isinstance(chunk.get("usage"), dict):
@@ -322,19 +325,20 @@ class StreamTally:
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
             if isinstance(delta.get("content"), str):
-                self.output_chars += len(delta["content"])
+                self.output.append(delta["content"])
             for tool_call in delta.get("tool_calls") or []:
                 arguments = (tool_call.get("function") or {}).get("arguments")
                 if isinstance(arguments, str):
-                    self.output_chars += len(arguments)
+                    self.output.append(arguments)
         if not self.show_usage and "usage" in chunk:
             chunk = {name: value for name, value in chunk.items() if name != "usage"}
             if not chunk.get("choices"):
                 return []  # The usage-only last chunk the client didn't ask for.
         return [_sse(chunk)]
 
-    def tokens(self, request: ChatCompletionRequest) -> tuple[int, int]:
-        """(input, output) tokens: the provider's count if it sent one, else an estimate.
+    async def tokens(self, request: ChatCompletionRequest) -> tuple[int, int]:
+        """(input, output) tokens: the provider's count if it sent one, else our own count
+        of the prompt and of what was streamed (e.g. a stream cut before its usage chunk).
 
         Nothing generated means nothing billed: the provider failed before answering.
         """
@@ -342,10 +346,11 @@ class StreamTally:
             return int(self.usage.get("prompt_tokens") or 0), int(
                 self.usage.get("completion_tokens") or 0
             )
-        if not self.output_chars:
+        if not self.output:
             return 0, 0
-        output = min(request.max_tokens or 0, math.ceil(self.output_chars / 4))
-        return estimate_prompt_tokens(request), output
+        prompt, output = await count_usage(request, "".join(self.output))
+        # The provider can't have generated more than it was allowed to.
+        return prompt, min(output, request.max_tokens or output)
 
 
 def _sse(data: dict[str, Any]) -> str:

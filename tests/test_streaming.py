@@ -18,11 +18,15 @@ from app.core.config import Settings
 from app.core.http import http_client
 from app.main import app
 from app.models import KeySpend, RequestLog, UsageOutbox
-from app.providers.base import ProviderError
+from app.providers.base import ChatCompletionRequest, ProviderError
 from app.providers.catalog import build_catalog, get_catalog
+from app.providers.tokens import count_prompt_tokens, count_text_tokens
 from tests.conftest import FAKE_PRICE, MODEL, STREAM_WORDS, create_key
 
 STREAMED_TEXT = "".join(STREAM_WORDS)
+HI = ChatCompletionRequest.model_validate(
+    {"model": MODEL, "messages": [{"role": "user", "content": "Hi"}]}
+)
 
 
 def price(input_tokens: int, output_tokens: int) -> int:
@@ -161,15 +165,26 @@ def test_stream_is_billed_from_the_providers_usage(api, provider, db_engine):
     assert usage.cost_micros == price(3, 4)
 
 
-def test_stream_without_usage_is_billed_from_an_estimate(api, provider, db_engine):
+def test_stream_without_usage_is_billed_by_counting_tokens(api, provider, db_engine):
     created = create_key(api)
     provider.send_usage = False
 
     stream(api, created["key"])
 
-    # About 4 characters per token: "Hi" is 1 prompt token, the answer 6 output tokens.
-    output = -(-len(STREAMED_TEXT) // 4)
-    assert spend(db_engine, created["id"]) == (price(1, output), 0)
+    prompt = count_prompt_tokens(HI)
+    assert spend(db_engine, created["id"]) == (price(prompt, count_text_tokens(STREAMED_TEXT)), 0)
+    request = logged(db_engine, created["id"])
+    assert (request.input_tokens, request.output_tokens) == (prompt, 4)
+
+
+def test_counted_output_is_capped_at_max_tokens(api, provider, db_engine):
+    # The provider ignores max_tokens=2, streams 4 tokens, and sends no usage.
+    created = create_key(api)
+    provider.send_usage = False
+
+    stream(api, created["key"], max_tokens=2)
+
+    assert logged(db_engine, created["id"]).output_tokens == 2
 
 
 def test_provider_failing_before_any_output_is_a_502_and_bills_nothing(api, provider, db_engine):
@@ -202,7 +217,8 @@ def test_stream_cut_midway_sends_an_error_event_and_bills_what_was_sent(api, pro
     assert json.loads(data[-1])["error"]["code"] == "provider_error"
     assert "[DONE]" not in data
     sent = "".join(STREAM_WORDS[:2])
-    assert spend(db_engine, created["id"]) == (price(1, -(-len(sent) // 4)), 0)
+    expected = price(count_prompt_tokens(HI), count_text_tokens(sent))
+    assert spend(db_engine, created["id"]) == (expected, 0)
     assert logged(db_engine, created["id"]).status == "provider_error"
 
 

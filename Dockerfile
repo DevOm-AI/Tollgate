@@ -16,6 +16,11 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
 
+# The tokenizer's vocabulary (for streams whose provider sends no usage), fetched at build
+# time so the app never downloads it while serving.
+ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken
+RUN python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
+
 COPY app ./app
 COPY alembic.ini ./
 COPY alembic ./alembic
