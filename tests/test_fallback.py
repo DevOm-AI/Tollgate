@@ -7,11 +7,11 @@ from pydantic import ValidationError
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
-from app.billing.pricing import cost_micros
+from app.billing.pricing import cost_micros, max_prompt_tokens
 from app.core.config import Settings, get_settings
 from app.main import app
 from app.models import KeySpend, RequestLog
-from app.providers.base import ProviderError, ProviderTimeout
+from app.providers.base import ChatCompletionRequest, ProviderError, ProviderTimeout
 from app.providers.catalog import Catalog, get_catalog
 from app.providers.mock import MockProvider
 from tests.conftest import ADMIN_KEY, FAKE_PRICE, STREAM_WORDS, FakeProvider, chat, create_key
@@ -251,3 +251,54 @@ def test_route_that_could_outlast_a_reservation_is_refused():
             provider_total_timeout_s=120,
             routes={"long": ["mock"] + [f"groq/m{i}" for i in range(4)]},
         )
+
+
+# --- Pricing across a route ---
+
+
+def test_hold_covers_the_costliest_provider_in_the_route(api, fakes, db_engine):
+    primary, fallback = fakes
+    created = create_key(api)
+    primary.error = ProviderError("fake: HTTP 503", status_code=503)
+    # A long answer from the pricier fallback: far past what a primary-priced hold covers.
+    fallback.completion_tokens = 1_000
+
+    chat(api, created["key"], model=ROUTE, max_tokens=1_000)
+
+    expected = cost_micros(
+        3, 1_000, FALLBACK_PRICE["input_micros_per_1k"], FALLBACK_PRICE["output_micros_per_1k"]
+    )
+    assert spend(db_engine, created["id"]) == (expected, 0)
+
+
+def test_primary_answering_is_billed_at_its_own_cheaper_price(api, fakes, db_engine):
+    primary, _ = fakes
+    created = create_key(api)
+    primary.completion_tokens = 1_000
+
+    chat(api, created["key"], model=ROUTE, max_tokens=1_000)
+
+    expected = cost_micros(
+        3, 1_000, FAKE_PRICE["input_micros_per_1k"], FAKE_PRICE["output_micros_per_1k"]
+    )
+    assert spend(db_engine, created["id"]) == (expected, 0)
+
+
+def test_budget_must_cover_the_costliest_provider_not_just_the_primary(api, fakes):
+    primary, _ = fakes
+    request = ChatCompletionRequest.model_validate(
+        {"model": ROUTE, "messages": [{"role": "user", "content": "Hi"}]}
+    )
+    primary_worst = cost_micros(
+        max_prompt_tokens(request),
+        100,
+        FAKE_PRICE["input_micros_per_1k"],
+        FAKE_PRICE["output_micros_per_1k"],
+    )
+    # Enough for the primary's worst case, not for the fallback's (twice the price).
+    key = create_key(api, monthly_budget_micros=primary_worst)["key"]
+
+    response = chat(api, key, model=ROUTE, max_tokens=100)
+
+    assert response.status_code == 402
+    assert primary.requests == []

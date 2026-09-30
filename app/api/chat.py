@@ -321,12 +321,17 @@ async def _open_call(
     except RateLimited as exc:
         raise _rate_limited(exc) from exc
 
-    # Then the budget: hold the most this request could cost before spending anything.
-    worst_case = cost_micros(
-        max_prompt_tokens(primary.upstream),
-        output_cap,
-        primary.price.input_micros_per_1k,
-        primary.price.output_micros_per_1k,
+    # Then the budget: hold the most this request could cost before spending anything. Any
+    # provider in the route may end up answering, so that's the costliest one's worst case;
+    # settle charges the price of the one that did and frees the rest.
+    worst_case = max(
+        cost_micros(
+            max_prompt_tokens(attempt.upstream),
+            output_cap,
+            attempt.price.input_micros_per_1k,
+            attempt.price.output_micros_per_1k,
+        )
+        for attempt in attempts
     )
     hold = await reserve(db, key, worst_case)
     if hold is None:
