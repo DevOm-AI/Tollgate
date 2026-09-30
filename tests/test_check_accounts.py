@@ -1,5 +1,6 @@
 import io
 import json
+import threading
 import urllib.error
 import urllib.request
 
@@ -77,7 +78,9 @@ def test_missing_key_is_reported_without_calling_the_service():
 def test_blank_key_counts_as_missing(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "")
 
-    result = run_check(Check("Groq", "GROQ_API_KEY", lambda value: "ok"), AccountKeys())
+    blank = AccountKeys(_env_file=None)
+
+    result = run_check(Check("Groq", "GROQ_API_KEY", lambda value: "ok"), blank)
 
     assert result.status == "missing"
 
@@ -115,6 +118,49 @@ def test_failure_message_keeps_only_the_first_line():
     result = run_check(check, keys(groq_api_key="gsk_x"))
 
     assert result.detail == "RuntimeError: first line"
+
+
+def test_probe_that_never_answers_fails_at_the_deadline():
+    stuck = threading.Event()
+
+    def probe(value: str) -> str:
+        stuck.wait()  # Like a query on a connection that went silent.
+        return "never"
+
+    check = Check("Neon Postgres", "NEON_DATABASE_URL", probe)
+    try:
+        result = run_check(check, keys(neon_database_url="postgresql://x"), deadline_seconds=0.1)
+    finally:
+        stuck.set()
+
+    assert result.status == "failed"
+    assert result.detail == "no answer within 0.1s"
+
+
+def test_main_still_runs_the_other_checks_after_a_stuck_one(monkeypatch, capsys):
+    stuck = threading.Event()
+    monkeypatch.setattr(check_accounts, "DEADLINE_SECONDS", 0.1)
+    monkeypatch.setattr(
+        check_accounts,
+        "CHECKS",
+        [
+            Check("Neon Postgres", "NEON_DATABASE_URL", lambda value: stuck.wait() and "never"),
+            Check("Groq", "GROQ_API_KEY", lambda value: "20 models"),
+        ],
+    )
+    monkeypatch.setattr(
+        check_accounts,
+        "AccountKeys",
+        lambda: keys(neon_database_url="postgresql://x", groq_api_key="gsk_x"),
+    )
+    try:
+        assert check_accounts.main() == 1
+    finally:
+        stuck.set()
+
+    output = capsys.readouterr().out
+    assert "Neon Postgres  failed   no answer within 0.1s" in output
+    assert "Groq           ok       20 models" in output
 
 
 def test_gemini_and_groq_count_models(responses):
@@ -180,6 +226,57 @@ def test_hf_read_only_token_fails(responses):
     }
 
     with pytest.raises(CheckFailed, match="read-only"):
+        check_hf("hf_x")
+
+
+def hf_fine_grained(*scoped: dict) -> dict:
+    return {
+        "name": "someone",
+        "auth": {
+            "accessToken": {
+                "role": "fineGrained",
+                "fineGrained": {"global": ["discussion.write"], "scoped": list(scoped)},
+            }
+        },
+    }
+
+
+def test_hf_fine_grained_token_with_repo_write_passes(responses):
+    responses[check_accounts.HF_WHOAMI_URL] = hf_fine_grained(
+        {"entity": {"type": "user", "name": "someone"}, "permissions": ["repo.content.read"]},
+        {
+            "entity": {"type": "space", "name": "someone/tollgate"},
+            "permissions": ["repo.content.read", "repo.write"],
+        },
+    )
+
+    assert check_hf("hf_x") == "someone (fine-grained, can write to space someone/tollgate)"
+
+
+def test_hf_fine_grained_token_with_read_only_permissions_fails(responses):
+    responses[check_accounts.HF_WHOAMI_URL] = hf_fine_grained(
+        {"entity": {"type": "user", "name": "someone"}, "permissions": ["repo.content.read"]},
+    )
+
+    with pytest.raises(CheckFailed, match="can't write to any repo"):
+        check_hf("hf_x")
+
+
+def test_hf_fine_grained_token_without_scopes_fails(responses):
+    responses[check_accounts.HF_WHOAMI_URL] = hf_fine_grained()
+
+    with pytest.raises(CheckFailed, match="can't write to any repo"):
+        check_hf("hf_x")
+
+
+@pytest.mark.parametrize("access_token", [{}, {"role": "admin"}])
+def test_hf_token_of_unknown_kind_fails(responses, access_token: dict):
+    responses[check_accounts.HF_WHOAMI_URL] = {
+        "name": "someone",
+        "auth": {"accessToken": access_token},
+    }
+
+    with pytest.raises(CheckFailed, match="can't confirm"):
         check_hf("hf_x")
 
 

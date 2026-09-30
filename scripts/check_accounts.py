@@ -8,6 +8,7 @@ Exits 1 when a key is missing or doesn't work. Where to get each key: docs/accou
 
 import json
 import sys
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -22,12 +23,16 @@ from sqlalchemy import create_engine, pool, text
 
 from app.core.config import STRIPE_LIVE_KEY_PREFIXES, normalize_database_url
 
+# Per network step (connect, read). A whole probe gets DEADLINE_SECONDS.
 TIMEOUT_SECONDS = 10
+DEADLINE_SECONDS = 30
 
 GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/openai/models"
 GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 STRIPE_BALANCE_URL = "https://api.stripe.com/v1/balance"
 HF_WHOAMI_URL = "https://huggingface.co/api/whoami-v2"
+# The fine-grained permission that allows pushing to a repo, Spaces included.
+HF_REPO_WRITE = "repo.write"
 
 
 class AccountKeys(BaseSettings):
@@ -54,10 +59,21 @@ class CheckFailed(Exception):
 
 
 def check_neon(url: str) -> str:
+    # connect_timeout only covers connecting. Once connected, a lost network is noticed
+    # by TCP (unacknowledged data, then keepalives) and a stuck server by statement_timeout,
+    # so the query fails and the connection is closed instead of waiting forever.
     engine = create_engine(
         normalize_database_url(url),
         poolclass=pool.NullPool,
-        connect_args={"connect_timeout": TIMEOUT_SECONDS},
+        connect_args={
+            "connect_timeout": TIMEOUT_SECONDS,
+            "tcp_user_timeout": TIMEOUT_SECONDS * 1000,
+            "keepalives": 1,
+            "keepalives_idle": 5,
+            "keepalives_interval": 2,
+            "keepalives_count": 3,
+            "options": f"-c statement_timeout={TIMEOUT_SECONDS * 1000}",
+        },
     )
     try:
         with engine.connect() as connection:
@@ -99,12 +115,30 @@ def check_stripe(key: str) -> str:
 
 
 def check_hf(token: str) -> str:
+    # Deploying pushes to the Space's git remote, so the token must be able to write.
+    # Anything that can't be confirmed as write access fails.
     whoami = _get_json(HF_WHOAMI_URL, token)
-    role = whoami.get("auth", {}).get("accessToken", {}).get("role", "unknown")
+    name = whoami["name"]
+    access_token = whoami.get("auth", {}).get("accessToken", {})
+    role = access_token.get("role")
+    if role == "write":
+        return f"{name} (write token)"
+    if role == "fineGrained":
+        scoped = access_token.get("fineGrained", {}).get("scoped", [])
+        writable = [
+            f"{scope['entity'].get('type')} {scope['entity'].get('name')}"
+            for scope in scoped
+            if HF_REPO_WRITE in scope.get("permissions", []) and "entity" in scope
+        ]
+        if not writable:
+            raise CheckFailed(
+                f"{name}'s fine-grained token can't write to any repo; "
+                "give it repo write access to your account or the Space"
+            )
+        return f"{name} (fine-grained, can write to {', '.join(writable)})"
     if role == "read":
-        # Deploying pushes to the Space's git remote, which needs write access.
-        raise CheckFailed(f"{whoami['name']}'s token is read-only; create a write token")
-    return f"{whoami['name']} ({role} token)"
+        raise CheckFailed(f"{name}'s token is read-only; create a write token")
+    raise CheckFailed(f"can't confirm {name}'s token can write (role {role!r}); use a write token")
 
 
 def _get_json(url: str, token: str) -> dict[str, Any]:
@@ -150,13 +184,13 @@ class Result:
     detail: str
 
 
-def run_check(check: Check, keys: AccountKeys) -> Result:
+def run_check(check: Check, keys: AccountKeys, deadline_seconds: float | None = None) -> Result:
     secret: SecretStr | None = getattr(keys, check.env_var.lower())
     if secret is None:
         return Result(check.label, "missing", f"set {check.env_var} in .env")
     value = secret.get_secret_value()
     try:
-        detail = check.probe(value)
+        detail = _run_with_deadline(check.probe, value, deadline_seconds or DEADLINE_SECONDS)
     except CheckFailed as exc:
         return Result(check.label, "failed", _redact(str(exc), value))
     except Exception as exc:
@@ -164,6 +198,31 @@ def run_check(check: Check, keys: AccountKeys) -> Result:
         message = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
         return Result(check.label, "failed", _redact(f"{type(exc).__name__}: {message}", value))
     return Result(check.label, "ok", detail)
+
+
+def _run_with_deadline(probe: Callable[[str], str], value: str, seconds: float) -> str:
+    """Run a probe, giving up after `seconds` so one stuck service can't stall the rest.
+
+    Timeouts inside a probe bound single steps; this bounds the whole probe, including
+    steps with no timeout of their own, such as DNS lookups. The probe runs in a daemon
+    thread: one that overruns is left behind, and its sockets close when the script exits.
+    """
+    outcome: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            outcome["detail"] = probe(value)
+        except Exception as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    if thread.is_alive():
+        raise CheckFailed(f"no answer within {seconds:g}s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["detail"]
 
 
 def _redact(message: str, value: str) -> str:
@@ -182,10 +241,13 @@ def _redact(message: str, value: str) -> str:
 
 def main() -> int:
     keys = AccountKeys()
-    results = [run_check(check, keys) for check in CHECKS]
-    width = max(len(result.label) for result in results)
-    for result in results:
-        print(f"{result.label:<{width}}  {result.status:<7}  {result.detail}")
+    width = max(len(check.label) for check in CHECKS)
+    results = []
+    for check in CHECKS:
+        result = run_check(check, keys)
+        # Print as each check finishes, so a slow one doesn't hide the others' results.
+        print(f"{result.label:<{width}}  {result.status:<7}  {result.detail}", flush=True)
+        results.append(result)
     if all(result.status == "ok" for result in results):
         print("\nAll accounts work.")
         return 0

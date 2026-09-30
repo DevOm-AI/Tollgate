@@ -57,7 +57,8 @@ Tollgate refuses to start with a live key (`sk_live_` / `rk_live_`) unless
 
 1. Create an account.
 2. Under **Settings → Access Tokens**, create a token with **write** access. Deploys push to
-   the Space's git remote, which a read-only token can't do.
+   the Space's git remote, which a read-only token can't do. A fine-grained token works too,
+   as long as it has repo write permission on your account or on the Space.
 3. Paste it as `HF_TOKEN`.
 
 ## Check them
@@ -74,7 +75,7 @@ Each check is a free, read-only call. None of them spends tokens or money:
 | Upstash      | `PING` over TLS                               |
 | Gemini, Groq | Lists models on the OpenAI-compatible API     |
 | Stripe       | Reads the balance and confirms it's test mode |
-| Hugging Face | `whoami`, and the token isn't read-only       |
+| Hugging Face | `whoami`, and the token can write to repos    |
 
 Output looks like this. Keys are never printed.
 
@@ -87,4 +88,5 @@ Stripe         ok       test mode
 Hugging Face   failed   HTTP 401 from huggingface.co (wrong key?)
 ```
 
+Each check gives up after 30 seconds, so one unreachable service can't hold up the rest.
 It exits with status 1 until every account works.
