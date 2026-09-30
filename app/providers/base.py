@@ -101,6 +101,15 @@ class ProviderError(Exception):
     def is_client_error(self) -> bool:
         return self.status_code in CLIENT_ERROR_STATUSES
 
+    @property
+    def retryable(self) -> bool:
+        """Worth trying another provider: no response (timeout, connection), 429, or 5xx.
+
+        Anything else is about the request itself, and another provider would refuse it too.
+        """
+        code = self.status_code
+        return code is None or code == 429 or code >= 500
+
 
 class ProviderTimeout(ProviderError):
     """The provider didn't connect, start answering, or finish answering in time."""
