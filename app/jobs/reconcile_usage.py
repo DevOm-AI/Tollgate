@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.billing.stripe_billing import StripeBilling
 from app.core.db import SessionLocal
+from app.jobs.schedule import seconds_until_daily
 
 logger = logging.getLogger(__name__)
 
@@ -99,10 +100,7 @@ async def reconcile(
 
 
 def seconds_until_next_run(now: datetime) -> float:
-    next_run = datetime.combine(now.date(), RUN_AT)
-    if next_run <= now:
-        next_run += timedelta(days=1)
-    return (next_run - now).total_seconds()
+    return seconds_until_daily(RUN_AT, now)
 
 
 async def run_forever(billing: StripeBilling) -> None:

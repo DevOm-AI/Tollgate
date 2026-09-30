@@ -43,7 +43,8 @@ services:
       start_period: 10s
 
   # Background jobs: release reservations left open past their expiry and send usage from
-  # the outbox to Stripe (each once a minute), and check Stripe against Postgres (daily).
+  # the outbox to Stripe (each once a minute); check Stripe against Postgres and reset the
+  # demo key's budget (daily).
   jobs:
     <<: *app
     command: python -m app.jobs
