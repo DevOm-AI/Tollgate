@@ -55,6 +55,10 @@ that counts against the limits reports both, like OpenAI does:
 | `X-RateLimit-Remaining-{Requests,Tokens}` | What's left right now                        |
 | `X-RateLimit-Reset-{Requests,Tokens}`     | Seconds until the limit is fully refilled    |
 
+If Redis is down, rate limits fail open: requests go ahead without limits and a warning is
+logged, because the budget in Postgres, not Redis, protects the money. The reasoning is in
+[docs/decisions.md](docs/decisions.md).
+
 ## Layout
 
 | Path            | What lives there                               |
