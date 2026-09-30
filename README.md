@@ -128,6 +128,10 @@ Stripe drops an identifier it has already seen, so a retry after a crash can't b
 Minutes are sent once they're over a minute old, so a settle committing just after the minute
 ends still makes it into that minute's event.
 
+Once a day (00:30 UTC) a reconciliation job compares each billed customer's usage for the
+previous UTC day in Postgres with Stripe's meter summary for that day, and logs any difference
+with both totals and how much of Tollgate's was sent.
+
 ## Rate limits
 
 Each key has two limits, both token buckets in Redis that refill every minute:

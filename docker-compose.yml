@@ -42,8 +42,8 @@ services:
       retries: 3
       start_period: 10s
 
-  # Background jobs, each once a minute: release reservations left open past their expiry,
-  # and send usage from the outbox to Stripe.
+  # Background jobs: release reservations left open past their expiry and send usage from
+  # the outbox to Stripe (each once a minute), and check Stripe against Postgres (daily).
   jobs:
     <<: *app
     command: python -m app.jobs
