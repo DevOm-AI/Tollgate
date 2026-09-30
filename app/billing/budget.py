@@ -43,14 +43,22 @@ class Outcome:
     latency_ms: int | None = None
 
 
-async def reserve(db: AsyncSession, key: ApiKey, amount_micros: int) -> Hold | None:
+async def reserve(
+    db: AsyncSession, key: ApiKey, amount_micros: int, now: datetime | None = None
+) -> Hold | None:
     """Hold `amount_micros` of the key's monthly budget, or return None if it won't fit.
 
     One conditional UPDATE claims the money: Postgres locks the key_spend row, so concurrent
     requests queue on it and each re-checks the budget against the latest total. Checking
     first and adding later would let a burst of requests all pass the check at once.
+
+    Budgets are per calendar month in UTC. A key's first request in a month creates that
+    month's key_spend row (INSERT ... ON CONFLICT DO NOTHING, so concurrent first requests
+    create it once); earlier months' spend doesn't count against it. The hold remembers its
+    month, so a request that straddles midnight on the 1st settles against the month it
+    reserved in.
     """
-    period = current_period()
+    period = current_period(now)
     await db.execute(insert(KeySpend).values(key_id=key.id, period=period).on_conflict_do_nothing())
     claimed = await db.execute(
         update(KeySpend)
