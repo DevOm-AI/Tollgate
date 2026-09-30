@@ -41,3 +41,17 @@ def test_counts_fall_back_to_characters_without_the_tokenizer(monkeypatch):
 
 def test_usage_is_counted_off_the_event_loop():
     assert anyio.run(count_usage, request("Hi"), "Hello from fake stream") == (7, 4)
+
+
+def test_tokenizer_that_cannot_load_falls_back_and_warns(monkeypatch, caplog):
+    def no_network(name):
+        raise OSError("can't download the vocabulary")
+
+    monkeypatch.setattr(tokens.tiktoken, "get_encoding", no_network)
+    tokens._encoding.cache_clear()
+    try:
+        with caplog.at_level("WARNING", logger="app.providers.tokens"):
+            assert count_text_tokens("a" * 8) == 2
+        assert "Tokenizer unavailable" in caplog.text
+    finally:
+        tokens._encoding.cache_clear()

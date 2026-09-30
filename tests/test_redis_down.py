@@ -87,3 +87,15 @@ def test_limits_apply_again_once_redis_is_back(api, provider, redis_down):
     app.dependency_overrides[get_redis] = reachable_redis
 
     assert [chat(api, key).status_code for _ in range(2)] == [200, 429]
+
+
+class RefusingBucket:
+    async def take(self, name, capacity, cost=1):
+        raise RedisConnectionError("gone")
+
+
+def test_requests_left_is_unknown_when_redis_is_down(caplog):
+    limiter = RateLimiter(RefusingBucket())
+
+    with caplog.at_level(logging.WARNING, logger="app.limits.rate_limit"):
+        assert asyncio.run(limiter.requests_left(uuid.uuid4(), 5)) is None

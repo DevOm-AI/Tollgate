@@ -235,5 +235,10 @@ docker compose up -d postgres redis
 uv sync
 uv run ruff check .
 uv run ruff format --check .
-uv run pytest
+uv run pytest --cov      # CI fails under 95% coverage
 ```
+
+Tests run against real Postgres and Redis (the compose services locally, service containers in
+CI): prices in micro-dollars, the Lua token bucket, reserve/settle/release, fallback rules,
+circuit breaker states, streaming and hang-ups, and the Stripe outbox with a fake Stripe client.
+The dashboard has its own tests: `cd web && npm test`.

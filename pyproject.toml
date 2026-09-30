@@ -41,5 +41,16 @@ pythonpath = ["."]
 dev = [
     "openai>=3.22.1",
     "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
     "ruff>=0.16.9",
 ]
+
+[tool.coverage.run]
+source = ["app", "scripts"]
+# SQLAlchemy's async layer runs code in greenlets, and the test client in a thread: without
+# these, lines after an await go uncounted.
+concurrency = ["greenlet", "thread"]
+
+[tool.coverage.report]
+skip_covered = true
+show_missing = true
