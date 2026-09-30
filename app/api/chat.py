@@ -1,6 +1,7 @@
 import time
 from typing import Annotated
 
+import anyio
 from fastapi import APIRouter, Depends, Response, status
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import select
@@ -114,34 +115,43 @@ async def chat_completions(
     started = time.perf_counter()
     completion: ChatCompletion | None = None
     failure: ProviderError | None = None
+    status_ = "error"  # Anything unexpected, until known otherwise.
     try:
         completion = await provider.complete(upstream)
+        status_ = "ok"
     except ProviderError as exc:
         failure = exc
+        status_ = "provider_error"
+    except anyio.get_cancelled_exc_class():
+        status_ = "cancelled"
+        raise
     finally:
-        # Runs even if the request is cancelled: the hold must never stay open.
-        usage = completion.usage if completion else None
-        await settle(
-            db,
-            hold,
-            cost_micros(
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                price.input_micros_per_1k,
-                price.output_micros_per_1k,
+        # Every way out settles: an answer is charged, anything else releases the hold and
+        # bills nothing. Shielded, so a cancelled request (e.g. a shutdown) still finishes
+        # this instead of leaving the money held until the sweep.
+        with anyio.CancelScope(shield=True):
+            usage = completion.usage if completion else None
+            await settle(
+                db,
+                hold,
+                cost_micros(
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    price.input_micros_per_1k,
+                    price.output_micros_per_1k,
+                )
+                if usage
+                else 0,
+                Outcome(
+                    model=body.model,
+                    provider=provider.name,
+                    status=status_,
+                    input_tokens=usage.prompt_tokens if usage else 0,
+                    output_tokens=usage.completion_tokens if usage else 0,
+                    latency_ms=round((time.perf_counter() - started) * 1000),
+                ),
             )
-            if usage
-            else 0,
-            Outcome(
-                model=body.model,
-                provider=provider.name,
-                status="ok" if usage else "provider_error" if failure else "error",
-                input_tokens=usage.prompt_tokens if usage else 0,
-                output_tokens=usage.completion_tokens if usage else 0,
-                latency_ms=round((time.perf_counter() - started) * 1000),
-            ),
-        )
-        tokens = await limiter.settle(admission, usage.total_tokens if usage else 0)
+            tokens = await limiter.settle(admission, usage.total_tokens if usage else 0)
     headers = rate_limit_headers(admission.requests, tokens)
     if failure is not None:
         raise _provider_failed(provider.name, failure, headers) from failure
