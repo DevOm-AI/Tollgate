@@ -21,16 +21,29 @@ class ResolvedModel:
 
 
 class Catalog:
-    """Which provider serves a model name.
+    """Which providers serve a model name.
 
     "mock" is the mock provider. "<provider>/<model>" (e.g. groq/llama-3.1-8b-instant) is
-    that provider's model, for each provider whose API key is set.
+    that provider's model, for each provider whose API key is set. A route name (e.g.
+    fast-chat) is its list of models, in order, skipping those whose provider isn't set up.
     """
 
-    def __init__(self, providers: list[Provider]) -> None:
+    def __init__(
+        self, providers: list[Provider], routes: dict[str, list[str]] | None = None
+    ) -> None:
         self.providers = {provider.name: provider for provider in providers}
+        self.routes = routes or {}
+
+    def is_route(self, model: str) -> bool:
+        return model in self.routes
+
+    def candidates(self, model: str) -> list[ResolvedModel]:
+        """The models to try for `model`, primary first. Empty if none can serve it."""
+        targets = self.routes.get(model, [model])
+        return [resolved for target in targets if (resolved := self.resolve(target))]
 
     def resolve(self, model: str) -> ResolvedModel | None:
+        """One model name ("mock" or "<provider>/<model>"), not a route."""
         if model == MOCK_MODEL:
             provider = self.providers.get(MOCK_MODEL)
             return ResolvedModel(provider, MOCK_MODEL) if provider else None
@@ -53,7 +66,7 @@ def build_catalog(settings: Settings, client: httpx2.AsyncClient) -> Catalog:
         providers.append(GroqProvider(settings.groq_api_key.get_secret_value(), client))
     if settings.gemini_api_key is not None:
         providers.append(GeminiProvider(settings.gemini_api_key.get_secret_value(), client))
-    return Catalog(providers)
+    return Catalog(providers, settings.routes)
 
 
 @lru_cache

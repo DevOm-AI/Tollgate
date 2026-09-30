@@ -30,6 +30,10 @@ Models:
 | `mock`               | The mock provider: fake text, costs nothing (see `MOCK_*`)  |
 | `groq/<model>`       | Groq, e.g. `groq/llama-3.1-8b-instant` (needs `GROQ_API_KEY`) |
 | `gemini/<model>`     | Gemini, e.g. `gemini/gemini-2.5-flash` (needs `GEMINI_API_KEY`) |
+| `fast-chat`          | A route: Groq's `llama-3.1-8b-instant`, then Gemini's `gemini-2.5-flash` |
+
+Routes let customers ask for a name while Tollgate picks the provider. Set them with
+`ROUTES` (JSON, route name -> models in order); models whose provider has no key are skipped.
 
 Requests without `max_tokens` (or `max_completion_tokens`) get `DEFAULT_MAX_TOKENS` (1,024), so
 every request has a known worst-case cost.
