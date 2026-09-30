@@ -152,6 +152,8 @@ class FakeProvider:
         self.chunk_delay_s = 0.0
         self.send_usage = True
         self.break_before_chunk: int | None = None
+        # Open with a role-only chunk, then pause this long before the first word.
+        self.role_chunk_then_pause_s: float | None = None
         # How far the last stream got: chunks sent, and whether it ran to the end.
         self.streamed_chunks = 0
         self.stream_completed = False
@@ -191,6 +193,10 @@ class FakeProvider:
         base["model"] = request.model
         self.streamed_chunks = 0
         self.stream_completed = False
+        if self.role_chunk_then_pause_s is not None:
+            role_only = {"role": "assistant", "content": ""}
+            yield base | {"choices": [{"index": 0, "delta": role_only, "finish_reason": None}]}
+            await asyncio.sleep(self.role_chunk_then_pause_s)
         for i, word in enumerate(STREAM_WORDS):
             if i == self.break_before_chunk:
                 raise ProviderError("fake: ReadError")

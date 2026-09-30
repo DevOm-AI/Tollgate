@@ -53,8 +53,9 @@ Tollgate cancels the provider's request at once (no paying for tokens nobody rea
 only what was generated until then.
 
 Every provider call has three timeouts (`PROVIDER_*_TIMEOUT_S`): 5 s to connect, 30 s to the
-first token, and 120 s for the whole answer, so a provider that connects and then goes silent
-can't hang a request. A timeout before any output is a `504` (`provider_timeout`) and costs
+first token of a stream (a role-only opening chunk doesn't count), and 120 s for the whole
+answer, so a provider that connects and then goes silent can't hang a request. A non-streaming
+answer arrives all at once, so it has no first token to wait for: the total limit bounds it. A timeout before any output is a `504` (`provider_timeout`) and costs
 nothing; mid-stream it ends the stream with an error event.
 
 Errors come back in OpenAI's format too, so the library raises its usual exceptions

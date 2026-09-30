@@ -318,11 +318,15 @@ async def _stream(call: GatedCall, body: ChatCompletionRequest) -> StreamingResp
     options = (body.model_extra or {}).get("stream_options") or {}
     tally = StreamTally(show_usage=bool(options.get("include_usage")))
     stream = OpenStream(call, call.provider.stream(call.upstream), tally)
+    # Chunks up to and including the first one with output. Providers often open with a
+    # role-only chunk before generating anything, so that doesn't count as the first token.
+    opening: list[dict[str, Any]] = []
     try:
         with anyio.fail_after(call.first_token_time_left()):
-            first = await anext(stream.chunks)
+            while not (opening and _has_output(opening[-1])):
+                opening.append(await anext(stream.chunks))
     except StopAsyncIteration:
-        first = None
+        pass
     except TimeoutError as exc:
         headers = await stream.close("timeout")
         timeout = ProviderTimeout(f"{call.provider.name}: no first token in time")
@@ -334,8 +338,8 @@ async def _stream(call: GatedCall, body: ChatCompletionRequest) -> StreamingResp
         cancelled = isinstance(exc, anyio.get_cancelled_exc_class())
         await stream.close("cancelled" if cancelled else "error")
         raise
-    # Counted now: the provider generated it, so it's billed even if it's never sent.
-    first_events = tally.forward(first) if first is not None else []
+    # Counted now: the provider generated them, so they're billed even if never sent.
+    first_events = [event for chunk in opening for event in tally.forward(chunk)]
 
     return HangUpAwareStreamingResponse(
         _forward(stream, first_events),
@@ -463,6 +467,17 @@ def _rate_limited(exc: RateLimited) -> OpenAIError:
         code="rate_limit_exceeded",
         headers=headers,
     )
+
+
+def _has_output(chunk: dict[str, Any]) -> bool:
+    """Whether a stream chunk carries part of the answer (or ends it), not just metadata."""
+    if chunk.get("usage"):
+        return True
+    for choice in chunk.get("choices") or []:
+        delta = choice.get("delta") or {}
+        if delta.get("content") or delta.get("tool_calls") or choice.get("finish_reason"):
+            return True
+    return False
 
 
 def _failure_status(exc: ProviderError) -> str:

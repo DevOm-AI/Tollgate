@@ -179,3 +179,29 @@ def test_stream_within_the_timeouts_is_unaffected(api, provider):
 
     assert response.status_code == 200
     assert response.text.endswith("data: [DONE]\n\n")
+
+
+def test_role_only_first_chunk_does_not_count_as_the_first_token(api, provider, db_engine):
+    use_timeouts(provider_first_token_timeout_s=0.3)
+    created = create_key(api)
+    provider.role_chunk_then_pause_s = 5
+
+    response, elapsed = timed(lambda: stream(api, created["key"]))
+
+    # Nothing but metadata before the deadline: still a clean 504, and nothing billed.
+    assert response.status_code == 504
+    assert elapsed < 2
+    assert spend(db_engine, created["id"]) == (0, 0)
+
+
+def test_role_only_first_chunk_is_still_forwarded(api, provider):
+    use_timeouts(provider_first_token_timeout_s=2)
+    key = create_key(api)["key"]
+    provider.role_chunk_then_pause_s = 0.1
+
+    response = stream(api, key)
+
+    events = [line.removeprefix("data: ") for line in response.text.split("\n\n") if line]
+    first = json.loads(events[0])["choices"][0]["delta"]
+    assert first == {"role": "assistant", "content": ""}
+    assert events[-1] == "[DONE]"
