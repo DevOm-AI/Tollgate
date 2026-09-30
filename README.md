@@ -36,8 +36,9 @@ Routes let customers ask for a name while Tollgate picks the provider. Set them 
 `ROUTES` (JSON, route name -> models in order); models whose provider has no key are skipped.
 
 If a provider times out, can't be reached, or answers `429` or `5xx`, Tollgate retries the
-request on the next model in the route, each with its own timeouts, and bills at the price of
-the provider that answered. A `400`-type rejection isn't retried: the request itself is the
+request on the next model in the route, each with its own timeouts. The budget hold is the
+worst case of the costliest provider in the route (any of them may end up answering), and the
+bill is at the price of the provider that actually answered. A `400`-type rejection isn't retried: the request itself is the
 problem. **Fallback only happens before the first byte reaches the client.** Once half an
 answer has been streamed, switching providers would glue two different answers together, so a
 failure mid-stream ends the stream with an error event instead.
