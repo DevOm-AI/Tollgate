@@ -154,6 +154,13 @@ If Redis is down, rate limits fail open: requests go ahead without limits and a 
 logged, because the budget in Postgres, not Redis, protects the money. The reasoning is in
 [docs/decisions.md](docs/decisions.md).
 
+## Dashboard
+
+`web/` is a React dashboard: per key, spend against budget, requests and tokens per day,
+p50/p95 latency, error rate by provider and the request log (metadata only), plus an admin
+view to create keys, change limits and revoke them. It uses the `/admin` API with the admin
+key; allow its origin with `CORS_ORIGINS`. See [web/README.md](web/README.md).
+
 ## Layout
 
 | Path            | What lives there                               |
