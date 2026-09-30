@@ -134,6 +134,34 @@ uv run python -m loadtest.overspend              # 10 runs of each, 500 requests
 
 CI runs one round of each on every push (`tests/test_overspend.py`).
 
+## Gateway overhead
+
+How much latency Tollgate adds: k6 posts the same chat completion to the mock provider
+directly (a plain HTTP server, no delay) and through Tollgate configured with the same mock,
+and compares p50/p95. Measured on a 4-core laptop (Intel i5-7300U), Postgres and Redis in
+Docker, one uvicorn worker, while other containers on the machine were busy:
+
+| 1 virtual user (no queueing) | p50 | p95 |
+| --- | --- | --- |
+| Mock directly | 0.5 ms | 1.1 ms |
+| Through Tollgate, run 1 | 22.3 ms | 31.4 ms |
+| Through Tollgate, run 2 | 22.3 ms | 67.5 ms |
+| Through Tollgate, run 3 | 23.1 ms | 69.5 ms |
+| **Tollgate adds** | **~22 ms** | **30–70 ms** (noisy machine) |
+
+Where the ~22 ms goes, per request: two durable Postgres commits (the budget reservation and
+the settle, about 4.5 ms each on this disk), about seven other Postgres statements and three
+Redis calls, and the Python in between. The commits are the price of never losing money state;
+the rest is round trips.
+
+With 10 virtual users one worker tops out around 50 requests/s, so latency becomes queueing
+(p50 171 ms, p95 361 ms): scale out with more workers or instances. Rerun on your own
+hardware (needs Docker for k6):
+
+```bash
+uv run python -m loadtest.overhead --vus 1 --duration 20s
+```
+
 ## Budgets
 
 Each key has a monthly budget (`monthly_budget_micros`, in micro-dollars: 1 USD = 1,000,000).
