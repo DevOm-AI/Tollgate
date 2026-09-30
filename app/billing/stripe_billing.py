@@ -88,7 +88,12 @@ class StripeBilling:
         return customer.id
 
     def ensure_subscription(self, stripe_customer_id: str, price_id: str) -> str:
-        """A subscription to the usage price. Invoiced monthly, so no card is needed."""
+        """A subscription to the usage price.
+
+        Charged automatically (Stripe's default): unlike invoices sent by email, that needs no
+        customer email to set up. Collecting the money needs a payment method on the Stripe
+        customer (added in Stripe, e.g. through Checkout); usage is metered either way.
+        """
         existing = self._client.v1.subscriptions.list(
             {"customer": stripe_customer_id, "price": price_id, "status": "active", "limit": 1}
         )
@@ -98,8 +103,6 @@ class StripeBilling:
             {
                 "customer": stripe_customer_id,
                 "items": [{"price": price_id}],
-                "collection_method": "send_invoice",
-                "days_until_due": 30,
             },
             {"idempotency_key": f"tollgate-subscription-{stripe_customer_id}-{price_id}"},
         )

@@ -13,7 +13,7 @@ from app.billing.budget import Outcome, current_period, reserve, settle
 from app.billing.pricing import cost_micros, max_prompt_tokens
 from app.main import app
 from app.models import ApiKey, KeySpend, RequestLog, Reservation, UsageOutbox
-from app.providers.base import ChatCompletionRequest, ProviderError
+from app.providers.base import ChatCompletionRequest, ProviderError, billable_output_tokens
 from tests.conftest import FAKE_PRICE, MODEL, chat, create_key
 
 # What the fake provider's answer costs: 3 prompt tokens and 4 output tokens.
@@ -329,3 +329,40 @@ def test_price_routes_need_the_admin_key(api, method, path):
     response = api.request(method, path, headers={"Authorization": "Bearer wrong"}, json={})
 
     assert response.status_code == 401
+
+
+# --- Thinking tokens ---
+
+
+@pytest.mark.parametrize(
+    ("prompt", "completion", "total", "billed"),
+    [
+        (76, 40, 116, 40),  # Groq/OpenAI: reasoning is inside completion_tokens.
+        (6, 14, 135, 129),  # Gemini: 115 thinking tokens only show in total_tokens.
+        (6, 0, 43, 37),  # Gemini that spent everything thinking: still billed.
+        (5, 3, None, 3),  # No total reported: completion_tokens is all there is.
+    ],
+)
+def test_billable_output_includes_thinking_tokens(prompt, completion, total, billed):
+    assert billable_output_tokens(prompt, completion, total) == billed
+
+
+def test_hidden_thinking_tokens_are_billed(api, provider, db_engine):
+    created = create_key(api)
+    # Like Gemini: 4 visible output tokens, 50 more thinking, only in total_tokens.
+    original = provider.complete
+
+    async def thinking(request):
+        completion = await original(request)
+        completion.usage.total_tokens += 50
+        return completion
+
+    provider.complete = thinking
+
+    chat(api, created["key"], max_tokens=100)
+
+    [request] = rows(db_engine, RequestLog, key_id=uuid.UUID(created["id"]))
+    assert request.output_tokens == 54
+    assert request.cost_micros == cost_micros(
+        3, 54, FAKE_PRICE["input_micros_per_1k"], FAKE_PRICE["output_micros_per_1k"]
+    )

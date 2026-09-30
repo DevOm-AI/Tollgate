@@ -60,8 +60,8 @@ def test_route_resolves_to_its_models_in_order():
     candidates = catalog.candidates("fast-chat")
 
     assert [(c.provider.name, c.upstream_model) for c in candidates] == [
-        ("groq", "llama-3.1-8b-instant"),
-        ("gemini", "gemini-2.5-flash"),
+        ("groq", "openai/gpt-oss-20b"),
+        ("gemini", "gemini-flash-latest"),
     ]
 
 

@@ -467,3 +467,20 @@ def test_streamed_tool_call_arguments_are_counted(api, provider, db_engine):
     stream(api, created["key"])
 
     assert logged(db_engine, created["id"]).output_tokens == count_text_tokens(arguments)
+
+
+def test_stream_bills_thinking_tokens_from_the_usage_chunk(api, provider, db_engine):
+    created = create_key(api)
+    base = {"id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m"}
+
+    async def gemini_like(request):
+        yield base | {"choices": [{"index": 0, "delta": {"content": "Hi"}}]}
+        yield base | {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        usage = {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 60}
+        yield base | {"choices": [], "usage": usage}
+
+    provider.stream = gemini_like
+
+    stream(api, created["key"])
+
+    assert logged(db_engine, created["id"]).output_tokens == 57

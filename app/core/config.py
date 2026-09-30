@@ -10,8 +10,10 @@ STRIPE_LIVE_KEY_PREFIXES = ("sk_live_", "rk_live_")
 
 # Route name -> models to try, in order: "<provider>/<model>" or "mock". Customers ask for the
 # route; Tollgate picks the provider. Targets whose provider has no API key are skipped.
+# Providers retire model names often (Groq dropped llama-3.1-8b-instant; Gemini closed
+# gemini-2.5-flash to new users), so check these against each provider's model list.
 DEFAULT_ROUTES: dict[str, list[str]] = {
-    "fast-chat": ["groq/llama-3.1-8b-instant", "gemini/gemini-2.5-flash"],
+    "fast-chat": ["groq/openai/gpt-oss-20b", "gemini/gemini-flash-latest"],
 }
 
 # How long a budget reservation may stay open before the sweep releases it as leaked.
@@ -85,7 +87,7 @@ class Settings(BaseSettings):
     demo_prompt_max_chars: int = Field(default=2000, gt=0)
 
     # Routes (see DEFAULT_ROUTES). From the environment as JSON:
-    # ROUTES='{"fast-chat": ["groq/llama-3.1-8b-instant", "gemini/gemini-2.5-flash"]}'
+    # ROUTES='{"fast-chat": ["groq/openai/gpt-oss-20b", "gemini/gemini-flash-latest"]}'
     routes: dict[str, list[str]] = Field(default_factory=lambda: dict(DEFAULT_ROUTES))
 
     # The mock provider (model "mock"): fake answers that cost nothing, for tests and demos.

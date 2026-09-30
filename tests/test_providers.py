@@ -321,10 +321,10 @@ def test_catalog_serves_providers_whose_key_is_set():
         httpx2.AsyncClient(),
     )
 
-    groq = catalog.resolve("groq/llama-3.1-8b-instant")
-    gemini = catalog.resolve("gemini/gemini-2.5-flash")
-    assert (groq.provider.name, groq.upstream_model) == ("groq", "llama-3.1-8b-instant")
-    assert (gemini.provider.name, gemini.upstream_model) == ("gemini", "gemini-2.5-flash")
+    groq = catalog.resolve("groq/openai/gpt-oss-20b")
+    gemini = catalog.resolve("gemini/gemini-flash-latest")
+    assert (groq.provider.name, groq.upstream_model) == ("groq", "openai/gpt-oss-20b")
+    assert (gemini.provider.name, gemini.upstream_model) == ("gemini", "gemini-flash-latest")
 
 
 def test_model_names_can_contain_slashes():

@@ -56,12 +56,28 @@ def estimate_prompt_tokens(request: ChatCompletionRequest) -> int:
     return max(1, math.ceil(chars / 4))
 
 
+def billable_output_tokens(prompt: int, completion: int, total: int | None) -> int:
+    """Output tokens to bill, from a provider's usage numbers.
+
+    OpenAI and Groq count reasoning inside completion_tokens. Gemini leaves its "thinking"
+    tokens out of completion_tokens but counts them in total_tokens, and charges them as
+    output, so the larger of the two readings is what the answer really cost.
+    """
+    if total is None:
+        return completion
+    return max(completion, total - prompt)
+
+
 class Usage(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     prompt_tokens: int = Field(ge=0)
     completion_tokens: int = Field(ge=0)
     total_tokens: int = Field(ge=0)
+
+    @property
+    def output_tokens(self) -> int:
+        return billable_output_tokens(self.prompt_tokens, self.completion_tokens, self.total_tokens)
 
 
 class ChatCompletion(BaseModel):
