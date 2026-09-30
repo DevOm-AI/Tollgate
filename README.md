@@ -161,6 +161,19 @@ p50/p95 latency, error rate by provider and the request log (metadata only), plu
 view to create keys, change limits and revoke them. It uses the `/admin` API with the admin
 key; allow its origin with `CORS_ORIGINS`. See [web/README.md](web/README.md).
 
+## Playground
+
+`#/playground` in the dashboard is a public page where anyone can type a prompt and watch the
+streamed answer, with live counters for the budget left, requests left this minute, and the
+cost of each answer. It uses a demo key ($0.10 budget, 5 requests a minute, the mock model)
+that never leaves the server: `POST /demo/chat` runs the prompt through the normal gateway as
+that key, with the model and answer length fixed server-side. Tollgate's own limits are what
+keep it safe to leave public.
+
+```bash
+uv run python -m scripts.create_demo_key   # prints DEMO_API_KEY=tg_live_...
+```
+
 ## Layout
 
 | Path            | What lives there                               |

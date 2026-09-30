@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { AdminApi } from "./api";
+import { Playground } from "./components/Playground";
+import { DemoApi } from "./demo";
 import { KeyPage } from "./components/KeyPage";
 import { KeysPage } from "./components/KeysPage";
 import { Login } from "./components/Login";
-import { loadSession, saveSession, type Session } from "./session";
+import { DEFAULT_API_URL, loadSession, saveSession, type Session } from "./session";
 
 // Hash routes, so the dashboard works as static files on any host: #/ and #/keys/<id>.
 function useRoute(): string {
@@ -26,6 +28,14 @@ export function App() {
     setSession(next);
   }
 
+  // The playground is public: no sign-in, and it only ever uses the demo routes.
+  if (route === "/playground") {
+    return (
+      <main>
+        <Playground api={new DemoApi(DEFAULT_API_URL)} />
+      </main>
+    );
+  }
   if (!api) return <Login onSignIn={signIn} />;
   const keyId = /^\/keys\/([\w-]+)$/.exec(route)?.[1];
 
@@ -36,6 +46,7 @@ export function App() {
           Tollgate
         </a>
         <span className="muted">{api.baseUrl}</span>
+        <a href="#/playground">Playground</a>
         <button type="button" className="link" onClick={() => signIn(null)}>
           Sign out
         </button>

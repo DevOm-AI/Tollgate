@@ -76,6 +76,14 @@ class Settings(BaseSettings):
     # CORS_ORIGINS='["https://tollgate.vercel.app"]'
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
 
+    # The public playground: a demo key (tg_live_..., from scripts/create_demo_key.py) that
+    # /demo/chat uses on visitors' behalf, the model it's limited to, and caps per request.
+    # Unset key = no playground. The key's own budget and limits keep the demo safe.
+    demo_api_key: SecretStr | None = None
+    demo_model: str = "mock"
+    demo_max_tokens: int = Field(default=256, gt=0)
+    demo_prompt_max_chars: int = Field(default=2000, gt=0)
+
     # Routes (see DEFAULT_ROUTES). From the environment as JSON:
     # ROUTES='{"fast-chat": ["groq/llama-3.1-8b-instant", "gemini/gemini-2.5-flash"]}'
     routes: dict[str, list[str]] = Field(default_factory=lambda: dict(DEFAULT_ROUTES))
