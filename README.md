@@ -48,7 +48,9 @@ Tollgate asks the provider for token usage at the end of every stream and bills 
 doesn't send usage, Tollgate counts the prompt and the streamed answer itself with a tokenizer
 (`cl100k_base`, baked into the Docker image), never billing more output than `max_tokens`. If a provider
 fails before sending anything you get a normal error; if it fails mid-answer the stream ends
-with an error event and you're billed for what was sent.
+with an error event and you're billed for what was sent. If you hang up mid-stream,
+Tollgate cancels the provider's request at once (no paying for tokens nobody reads) and bills
+only what was generated until then.
 
 Errors come back in OpenAI's format too, so the library raises its usual exceptions
 (`AuthenticationError` for a wrong or revoked key, `NotFoundError` for an unknown model).

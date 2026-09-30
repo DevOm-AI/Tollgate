@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.types import Receive, Scope, Send
 
 from app.api.errors import OpenAIError
 from app.billing.budget import Hold, Outcome, reserve, settle
@@ -228,6 +229,33 @@ async def _open_call(
 STREAM_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
+class HangUpAwareStreamingResponse(StreamingResponse):
+    """A StreamingResponse that stops the stream the moment the client hangs up.
+
+    Starlette only watches for the disconnect under ASGI spec < 2.4; from 2.4 it waits for a
+    send to fail and leaves the generator open, so the provider would keep generating (and
+    Tollgate paying) for nobody. This watches under every spec and always closes the
+    generator, which stops the provider's stream and settles what was generated.
+    """
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            async with anyio.create_task_group() as task_group:
+
+                async def stream_then_stop() -> None:
+                    await self.stream_response(send)
+                    task_group.cancel_scope.cancel()
+
+                task_group.start_soon(stream_then_stop)
+                await self.listen_for_disconnect(receive)
+                task_group.cancel_scope.cancel()
+        except* OSError:
+            pass  # A send failed: the client is gone.
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
+
+
 async def _stream(call: GatedCall, body: ChatCompletionRequest) -> StreamingResponse:
     """Forward the provider's chunks as Server-Sent Events, as they arrive.
 
@@ -253,7 +281,7 @@ async def _stream(call: GatedCall, body: ChatCompletionRequest) -> StreamingResp
         await _close_stream(call, chunks, tally, status_)
         raise
 
-    return StreamingResponse(
+    return HangUpAwareStreamingResponse(
         _forward(call, first, chunks, tally),
         media_type="text/event-stream",
         headers=rate_limit_headers(call.admission.requests, call.admission.tokens) | STREAM_HEADERS,
@@ -288,8 +316,8 @@ async def _forward(
                 }
             }
         )
-    except anyio.get_cancelled_exc_class():
-        status_ = "cancelled"  # The client went away.
+    except (anyio.get_cancelled_exc_class(), GeneratorExit):
+        status_ = "cancelled"  # The client hung up.
         raise
     finally:
         await _close_stream(call, chunks, tally, status_)
