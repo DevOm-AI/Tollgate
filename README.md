@@ -37,6 +37,27 @@ every request has a known worst-case cost.
 Errors come back in OpenAI's format too, so the library raises its usual exceptions
 (`AuthenticationError` for a wrong or revoked key, `NotFoundError` for an unknown model).
 
+## Budgets
+
+Each key has a monthly budget (`monthly_budget_micros`, in micro-dollars: 1 USD = 1,000,000).
+Money is always whole micro-dollars, never floats, and costs round up.
+
+Before a request reaches a provider, Tollgate reserves its worst-case cost (a byte-count
+upper bound on the prompt plus `max_tokens`, at the model's price) with one conditional
+`UPDATE` in Postgres. If the reservation doesn't fit the budget, the answer is `402` with
+code `budget_exceeded`. After the answer, one transaction charges the real cost, frees the
+rest, and records the request and its usage for Stripe. A failed call is charged nothing.
+
+Requests are only served for priced models. The mock is priced by the migrations; set the
+rest (per 1,000 tokens, in micro-dollars) with the admin API:
+
+```bash
+curl -X PUT -H "Authorization: Bearer $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"provider": "groq", "model": "llama-3.1-8b-instant",
+       "input_micros_per_1k": 50, "output_micros_per_1k": 80}' \
+  http://localhost:8001/admin/prices
+```
+
 ## Rate limits
 
 Each key has two limits, both token buckets in Redis that refill every minute:

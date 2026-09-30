@@ -127,6 +127,13 @@ def create_key(api: TestClient, **limits) -> dict:
 
 
 MODEL = "fake/test-model"
+# Micro-dollars per 1,000 tokens: $1 per million input tokens, $2 per million output tokens.
+FAKE_PRICE = {
+    "provider": "fake",
+    "model": "test-model",
+    "input_micros_per_1k": 1000,
+    "output_micros_per_1k": 2000,
+}
 
 
 class FakeProvider:
@@ -169,6 +176,8 @@ class FakeProvider:
 def provider(api: TestClient) -> FakeProvider:
     fake = FakeProvider()
     app.dependency_overrides[get_catalog] = lambda: Catalog([fake])
+    response = api.put("/admin/prices", json=FAKE_PRICE)
+    assert response.status_code == 200, response.text
     return fake
 
 

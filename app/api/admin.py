@@ -4,12 +4,14 @@ from typing import Annotated, Self
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.security import generate_api_key, require_admin
-from app.models import ApiKey, Customer
+from app.models import ApiKey, Customer, ModelPrice
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
@@ -76,6 +78,17 @@ class KeyOut(BaseModel):
     created_at: datetime
 
 
+class ModelPriceIn(BaseModel):
+    """A provider's price for a model, per 1,000 tokens, in micro-dollars (1 USD = 1e6)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    provider: str = Field(min_length=1, max_length=50, examples=["groq"])
+    model: str = Field(min_length=1, max_length=200, description="The provider's own model name")
+    input_micros_per_1k: Annotated[int, Field(ge=0, le=INT64_MAX)]
+    output_micros_per_1k: Annotated[int, Field(ge=0, le=INT64_MAX)]
+
+
 class KeyCreated(KeyOut):
     key: str = Field(description="The full key. Shown only in this response; store it now.")
 
@@ -129,6 +142,25 @@ async def revoke_key(key_id: uuid.UUID, db: Db) -> KeyOut:
     key.is_active = False
     await db.commit()
     return KeyOut.model_validate(key)
+
+
+@router.put("/prices")
+async def set_price(body: ModelPriceIn, db: Db) -> ModelPriceIn:
+    """Add or change a model's price. Requests for a model with no price are refused."""
+    prices = body.model_dump(include={"input_micros_per_1k", "output_micros_per_1k"})
+    await db.execute(
+        insert(ModelPrice)
+        .values(**body.model_dump())
+        .on_conflict_do_update(index_elements=["provider", "model"], set_=prices)
+    )
+    await db.commit()
+    return body
+
+
+@router.get("/prices")
+async def list_prices(db: Db) -> list[ModelPriceIn]:
+    rows = await db.scalars(select(ModelPrice).order_by(ModelPrice.provider, ModelPrice.model))
+    return [ModelPriceIn.model_validate(row) for row in rows]
 
 
 async def _get_key(db: AsyncSession, key_id: uuid.UUID) -> ApiKey:

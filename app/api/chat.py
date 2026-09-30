@@ -1,3 +1,4 @@
+import time
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Response, status
@@ -6,6 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.errors import OpenAIError
+from app.billing.budget import Outcome, reserve, settle
+from app.billing.pricing import cost_micros, max_prompt_tokens
 from app.core.config import Settings, get_settings
 from app.core.db import get_db
 from app.core.security import bearer, hash_api_key
@@ -16,7 +19,7 @@ from app.limits.rate_limit import (
     rate_limit_headers,
     retry_after,
 )
-from app.models import ApiKey
+from app.models import ApiKey, ModelPrice
 from app.providers.base import (
     ChatCompletion,
     ChatCompletionRequest,
@@ -57,6 +60,7 @@ async def chat_completions(
     body: ChatCompletionRequest,
     response: Response,
     key: Annotated[ApiKey, Depends(require_customer_key)],
+    db: Annotated[AsyncSession, Depends(get_db)],
     catalog: Annotated[Catalog, Depends(get_catalog)],
     settings: Annotated[Settings, Depends(get_settings)],
     limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
@@ -73,9 +77,20 @@ async def chat_completions(
             param="model",
         )
     provider = resolved.provider
+    price = await db.get(ModelPrice, (provider.name, resolved.upstream_model))
+    if price is None:
+        # Without a price the request can't be budgeted, so it never reaches the provider.
+        raise OpenAIError(
+            status.HTTP_400_BAD_REQUEST,
+            f"The model '{body.model}' has no price set, so it can't be billed",
+            code="model_not_priced",
+            param="model",
+        )
     upstream = body.for_upstream(
         resolved.upstream_model, body.output_cap(settings.default_max_tokens), stream=False
     )
+
+    # Rate limits first: they're cheap (Redis) and keep floods off Postgres.
     # Worst case for tokens per minute: the whole prompt plus a full-length answer.
     estimated_tokens = estimate_prompt_tokens(upstream) + upstream.max_tokens
     try:
@@ -83,19 +98,67 @@ async def chat_completions(
     except RateLimited as exc:
         raise _rate_limited(exc) from exc
 
-    # A failed call used no tokens, so the whole estimate goes back.
-    actual_tokens = 0
+    # Then the budget: hold the most this request could cost before spending anything.
+    worst_case = cost_micros(
+        max_prompt_tokens(upstream),
+        upstream.max_tokens,
+        price.input_micros_per_1k,
+        price.output_micros_per_1k,
+    )
+    hold = await reserve(db, key, worst_case)
+    if hold is None:
+        # Not going ahead, so it uses none of the tokens it took.
+        tokens = await limiter.settle(admission, 0)
+        raise _budget_exceeded(worst_case, rate_limit_headers(admission.requests, tokens))
+
+    started = time.perf_counter()
+    completion: ChatCompletion | None = None
+    failure: ProviderError | None = None
     try:
-        try:
-            completion = await provider.complete(upstream)
-            actual_tokens = completion.usage.total_tokens
-        finally:
-            tokens = await limiter.settle(admission, actual_tokens)
-            headers = rate_limit_headers(admission.requests, tokens)
+        completion = await provider.complete(upstream)
     except ProviderError as exc:
-        raise _provider_failed(provider.name, exc, headers) from exc
+        failure = exc
+    finally:
+        # Runs even if the request is cancelled: the hold must never stay open.
+        usage = completion.usage if completion else None
+        await settle(
+            db,
+            hold,
+            cost_micros(
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                price.input_micros_per_1k,
+                price.output_micros_per_1k,
+            )
+            if usage
+            else 0,
+            Outcome(
+                model=body.model,
+                provider=provider.name,
+                status="ok" if usage else "provider_error" if failure else "error",
+                input_tokens=usage.prompt_tokens if usage else 0,
+                output_tokens=usage.completion_tokens if usage else 0,
+                latency_ms=round((time.perf_counter() - started) * 1000),
+            ),
+        )
+        tokens = await limiter.settle(admission, usage.total_tokens if usage else 0)
+    headers = rate_limit_headers(admission.requests, tokens)
+    if failure is not None:
+        raise _provider_failed(provider.name, failure, headers) from failure
     response.headers.update(headers)
     return completion
+
+
+def _budget_exceeded(worst_case: int, headers: dict[str, str]) -> OpenAIError:
+    return OpenAIError(
+        status.HTTP_402_PAYMENT_REQUIRED,
+        "Monthly budget exceeded: this request could cost up to "
+        f"{worst_case} micro-dollars and the key's remaining budget can't cover it. "
+        "Lower max_tokens or raise the budget.",
+        type="insufficient_quota",
+        code="budget_exceeded",
+        headers=headers,
+    )
 
 
 def _rate_limited(exc: RateLimited) -> OpenAIError:
