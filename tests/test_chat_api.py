@@ -144,6 +144,14 @@ def test_validation_error_does_not_echo_the_prompt(api, provider, customer_key):
     assert "my secret prompt" not in response.text
 
 
+def test_malformed_content_part_is_not_a_server_error(api, provider, customer_key):
+    content = [{"type": "text", "text": None}, {"type": "text", "text": "Hi"}]
+
+    response = chat(api, customer_key, messages=[{"role": "user", "content": content}])
+
+    assert response.status_code == 200
+
+
 def test_unknown_model_is_404(api, provider, customer_key):
     response = chat(api, customer_key, model="no-such-model")
 

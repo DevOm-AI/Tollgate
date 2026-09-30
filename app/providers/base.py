@@ -50,7 +50,9 @@ def estimate_prompt_tokens(request: ChatCompletionRequest) -> int:
         if isinstance(message.content, str):
             chars += len(message.content)
         elif message.content:
-            chars += sum(len(part.get("text", "")) for part in message.content)
+            # Only text parts count; a malformed part (e.g. "text": null) counts as nothing.
+            texts = (part.get("text") for part in message.content)
+            chars += sum(len(text) for text in texts if isinstance(text, str))
     return max(1, math.ceil(chars / 4))
 
 

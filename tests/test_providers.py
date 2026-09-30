@@ -78,6 +78,13 @@ def test_prompt_estimate_counts_text_parts():
     assert estimate_prompt_tokens(request(messages=[{"role": "user", "content": ""}])) == 1
 
 
+@pytest.mark.parametrize("text", [None, 5, ["a"]])
+def test_prompt_estimate_skips_parts_without_string_text(text):
+    parts = [{"type": "text", "text": text}, {"type": "text", "text": "a" * 8}]
+
+    assert estimate_prompt_tokens(request(messages=[{"role": "user", "content": parts}])) == 2
+
+
 def test_mock_waits_for_its_delay():
     started = time.perf_counter()
     asyncio.run(MockProvider(delay_ms=50).complete(request()))
