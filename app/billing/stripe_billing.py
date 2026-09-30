@@ -105,6 +105,23 @@ class StripeBilling:
         )
         return subscription.id
 
+    def send_usage(
+        self, stripe_customer_id: str, micros: int, timestamp: int, identifier: str
+    ) -> None:
+        """Report `micros` of usage for one customer and minute as a meter event.
+
+        Stripe drops an event whose `identifier` it has already seen, so sending the same
+        usage again (a retry after a crash) can't bill it twice.
+        """
+        self._client.v1.billing.meter_events.create(
+            {
+                "event_name": METER_EVENT_NAME,
+                "payload": {METER_CUSTOMER_KEY: stripe_customer_id, METER_VALUE_KEY: str(micros)},
+                "timestamp": timestamp,
+                "identifier": identifier,
+            }
+        )
+
     def set_up_customer(
         self, customer_id: uuid.UUID, name: str, stripe_customer_id: str | None
     ) -> CustomerBilling:

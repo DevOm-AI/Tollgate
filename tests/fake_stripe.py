@@ -20,6 +20,11 @@ class _Resource:
         key = (options or {}).get("idempotency_key")
         if key and key in self._fake.idempotent:
             return self._fake.idempotent[key]
+        if self._kind == "meter_events":
+            # Like Stripe: an event whose identifier was already seen is dropped.
+            for event in self._fake.objects["meter_events"]:
+                if event.identifier == params["identifier"]:
+                    return event
         obj = SimpleNamespace(id=f"{self._prefix}_{uuid.uuid4().hex[:14]}", **params)
         self._fake.objects[self._kind].append(obj)
         if key:

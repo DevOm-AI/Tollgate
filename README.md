@@ -94,8 +94,7 @@ rest, and records the request and its usage for Stripe. A failed call is charged
 
 If Tollgate crashes between reserving and settling, the money stays held until the
 reservation expires (10 minutes); a job then releases it and bills nothing, since the request
-never finished. Locally the `jobs` service runs it every minute
-(`python -m app.jobs.sweep_reservations`).
+never finished. Locally the `jobs` service runs it every minute (`python -m app.jobs`).
 
 Requests are only served for priced models. The mock is priced by the migrations; set the
 rest (per 1,000 tokens, in micro-dollars) with the admin API:
@@ -120,6 +119,14 @@ curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
 ```
 
 Both are safe to run again: they find what already exists.
+
+Usage reaches Stripe through an outbox. Settle writes a `usage_outbox` row in the same
+transaction that charges the budget, so usage can't be lost between Tollgate and Stripe. Every
+minute a job groups unsent rows by customer and minute, sends one meter event per group with a
+fixed identifier (customer + minute), and marks the rows sent only after Stripe answers OK.
+Stripe drops an identifier it has already seen, so a retry after a crash can't bill twice.
+Minutes are sent once they're over a minute old, so a settle committing just after the minute
+ends still makes it into that minute's event.
 
 ## Rate limits
 
