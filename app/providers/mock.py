@@ -88,7 +88,7 @@ class MockProvider:
             raise ProviderError("mock: simulated failure", status_code=503)
 
     def _answer(self, request: ChatCompletionRequest) -> tuple[list[str], str]:
-        cap = request.max_tokens or self.output_tokens
+        cap = request.output_cap(self.output_tokens)
         count = min(self.output_tokens, cap)
         finish_reason = "length" if cap < self.output_tokens else "stop"
         return list(islice(cycle(WORDS), count)), finish_reason

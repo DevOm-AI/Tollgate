@@ -54,6 +54,14 @@ def test_mock_answer_is_cut_to_max_tokens():
     assert completion.choices[0]["finish_reason"] == "length"
 
 
+def test_mock_answer_is_cut_to_max_completion_tokens():
+    provider = MockProvider(output_tokens=50)
+
+    completion = asyncio.run(provider.complete(request(max_completion_tokens=4)))
+
+    assert completion.usage.completion_tokens == 4
+
+
 def test_mock_counts_prompt_tokens():
     completion = asyncio.run(MockProvider().complete(request()))
 
