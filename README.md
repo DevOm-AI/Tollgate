@@ -174,6 +174,9 @@ keep it safe to leave public.
 uv run python -m scripts.create_demo_key   # prints DEMO_API_KEY=tg_live_...
 ```
 
+Each day at 00:00 UTC a job resets the demo key's spend, so the playground keeps working for
+the next visitor (money held by requests in flight stays held).
+
 ## Layout
 
 | Path            | What lives there                               |
