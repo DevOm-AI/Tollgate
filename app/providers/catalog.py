@@ -23,7 +23,7 @@ class ResolvedModel:
 class Catalog:
     """Which providers serve a model name.
 
-    "mock" is the mock provider. "<provider>/<model>" (e.g. groq/llama-3.1-8b-instant) is
+    "mock" is the mock provider. "<provider>/<model>" (e.g. groq/openai/gpt-oss-20b) is
     that provider's model, for each provider whose API key is set. A route name (e.g.
     fast-chat) is its list of models, in order, skipping those whose provider isn't set up.
     """

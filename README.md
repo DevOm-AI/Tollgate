@@ -28,9 +28,9 @@ Models:
 | `model`              | Served by                                                   |
 | -------------------- | ----------------------------------------------------------- |
 | `mock`               | The mock provider: fake text, costs nothing (see `MOCK_*`)  |
-| `groq/<model>`       | Groq, e.g. `groq/llama-3.1-8b-instant` (needs `GROQ_API_KEY`) |
-| `gemini/<model>`     | Gemini, e.g. `gemini/gemini-2.5-flash` (needs `GEMINI_API_KEY`) |
-| `fast-chat`          | A route: Groq's `llama-3.1-8b-instant`, then Gemini's `gemini-2.5-flash` |
+| `groq/<model>`       | Groq, e.g. `groq/openai/gpt-oss-20b` (needs `GROQ_API_KEY`) |
+| `gemini/<model>`     | Gemini, e.g. `gemini/gemini-flash-latest` (needs `GEMINI_API_KEY`) |
+| `fast-chat`          | A route: Groq's `openai/gpt-oss-20b`, then Gemini's `gemini-flash-latest` |
 
 Routes let customers ask for a name while Tollgate picks the provider. Set them with
 `ROUTES` (JSON, route name -> models in order); models whose provider has no key are skipped.
@@ -212,13 +212,17 @@ If Tollgate crashes between reserving and settling, the money stays held until t
 reservation expires (10 minutes); a job then releases it and bills nothing, since the request
 never finished. Locally the `jobs` service runs it every minute (`python -m app.jobs`).
 
+Output is billed from the provider's usage report, including reasoning ("thinking") tokens:
+Gemini leaves them out of `completion_tokens` but counts them in `total_tokens` and charges
+them as output, so Tollgate bills the larger of the two readings.
+
 Requests are only served for priced models. The mock is priced by the migrations; set the
 rest (per 1,000 tokens, in micro-dollars) with the admin API:
 
 ```bash
 curl -X PUT -H "Authorization: Bearer $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"provider": "groq", "model": "llama-3.1-8b-instant",
-       "input_micros_per_1k": 50, "output_micros_per_1k": 80}' \
+  -d '{"provider": "groq", "model": "openai/gpt-oss-20b",
+       "input_micros_per_1k": 75, "output_micros_per_1k": 300}' \
   http://localhost:8001/admin/prices
 ```
 
@@ -234,7 +238,9 @@ curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
   http://localhost:8001/admin/customers/<customer-id>/billing   # Stripe customer + subscription
 ```
 
-Both are safe to run again: they find what already exists.
+Both are safe to run again: they find what already exists. Subscriptions are charged
+automatically (Stripe's default), so no customer email is needed to set one up; to collect the
+money, add a payment method to the Stripe customer in Stripe.
 
 Usage reaches Stripe through an outbox. Settle writes a `usage_outbox` row in the same
 transaction that charges the budget, so usage can't be lost between Tollgate and Stripe. Every

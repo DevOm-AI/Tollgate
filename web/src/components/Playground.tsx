@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { ApiError } from "../api";
-import { costMicros, type DemoApi, type DemoStatus, type Usage } from "../demo";
+import { costMicros, outputTokens, type DemoApi, type DemoStatus, type Usage } from "../demo";
 import { dollars } from "../format";
 
 export function Playground({ api }: { api: DemoApi }) {
@@ -74,7 +74,7 @@ export function Playground({ api }: { api: DemoApi }) {
           <strong>{cost === null ? "—" : dollars(cost)}</strong>
           {usage && (
             <span className="muted">
-              {usage.prompt_tokens} in / {usage.completion_tokens} out tokens
+              {usage.prompt_tokens} in / {outputTokens(usage)} out tokens
             </span>
           )}
         </div>

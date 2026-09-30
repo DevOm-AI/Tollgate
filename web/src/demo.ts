@@ -19,11 +19,18 @@ export interface DemoStatus {
 export interface Usage {
   prompt_tokens: number;
   completion_tokens: number;
+  total_tokens?: number;
+}
+
+/** Output tokens Tollgate bills: Gemini's "thinking" only shows in total_tokens. */
+export function outputTokens(usage: Usage): number {
+  if (usage.total_tokens === undefined) return usage.completion_tokens;
+  return Math.max(usage.completion_tokens, usage.total_tokens - usage.prompt_tokens);
 }
 
 /** Tollgate's formula: whole micro-dollars, rounded up. */
 export function costMicros(usage: Usage, inputPer1k: number, outputPer1k: number): number {
-  return Math.ceil((usage.prompt_tokens * inputPer1k + usage.completion_tokens * outputPer1k) / 1000);
+  return Math.ceil((usage.prompt_tokens * inputPer1k + outputTokens(usage) * outputPer1k) / 1000);
 }
 
 export interface StreamHandlers {

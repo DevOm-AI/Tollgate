@@ -34,6 +34,7 @@ from app.providers.base import (
     Provider,
     ProviderError,
     ProviderTimeout,
+    billable_output_tokens,
     estimate_prompt_tokens,
 )
 from app.providers.breaker import Breakers, get_breakers
@@ -246,7 +247,7 @@ async def chat_completions(
         headers = await call.finish(
             status_,
             usage.prompt_tokens if usage else 0,
-            usage.completion_tokens if usage else 0,
+            usage.output_tokens if usage else 0,
         )
     if unavailable:
         raise _providers_unavailable(body.model, call.seconds_until_available(), headers)
@@ -562,8 +563,12 @@ class StreamTally:
         Nothing generated means nothing billed: the provider failed before answering.
         """
         if self.usage is not None:
-            return int(self.usage.get("prompt_tokens") or 0), int(
-                self.usage.get("completion_tokens") or 0
+            prompt = int(self.usage.get("prompt_tokens") or 0)
+            total = self.usage.get("total_tokens")
+            return prompt, billable_output_tokens(
+                prompt,
+                int(self.usage.get("completion_tokens") or 0),
+                int(total) if total is not None else None,
             )
         if not self.output:
             return 0, 0

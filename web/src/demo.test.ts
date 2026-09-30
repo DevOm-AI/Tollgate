@@ -1,4 +1,4 @@
-import { costMicros, DemoApi } from "./demo";
+import { costMicros, DemoApi, outputTokens } from "./demo";
 
 function sseResponse(events: unknown[], headers: Record<string, string> = {}): Response {
   const body = events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join("") + "data: [DONE]\n\n";
@@ -10,6 +10,12 @@ describe("costMicros", () => {
     expect(costMicros({ prompt_tokens: 1, completion_tokens: 32 }, 100, 400)).toBe(13);
     expect(costMicros({ prompt_tokens: 10, completion_tokens: 0 }, 100, 400)).toBe(1);
     expect(costMicros({ prompt_tokens: 0, completion_tokens: 0 }, 100, 400)).toBe(0);
+  });
+
+  it("bills thinking tokens that only show in total_tokens", () => {
+    const gemini = { prompt_tokens: 6, completion_tokens: 14, total_tokens: 135 };
+    expect(outputTokens(gemini)).toBe(129);
+    expect(costMicros(gemini, 300, 2500)).toBe(Math.ceil((6 * 300 + 129 * 2500) / 1000));
   });
 });
 

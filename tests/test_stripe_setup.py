@@ -75,8 +75,8 @@ def test_customer_gets_a_stripe_customer_and_an_invoiced_subscription(billing, f
     [subscription] = fake.created("subscriptions")
     assert subscription["customer"] == result.stripe_customer_id
     assert subscription["items"] == [{"price": result.price_id}]
-    # Invoiced monthly: no card needed.
-    assert subscription["collection_method"] == "send_invoice"
+    # Charged automatically (Stripe's default): no customer email needed to subscribe.
+    assert "collection_method" not in subscription
 
 
 def test_existing_stripe_customer_is_reused(billing, fake):
