@@ -6,11 +6,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.errors import OpenAIError
+from app.core.config import Settings, get_settings
 from app.core.db import get_db
 from app.core.security import bearer, hash_api_key
 from app.models import ApiKey
-from app.providers.base import ChatCompletion, ChatCompletionRequest, Provider, ProviderError
-from app.providers.catalog import get_catalog
+from app.providers.base import ChatCompletion, ChatCompletionRequest, ProviderError
+from app.providers.catalog import Catalog, get_catalog
 
 router = APIRouter(prefix="/v1", tags=["openai"])
 
@@ -43,26 +44,43 @@ def _invalid_key(message: str) -> OpenAIError:
 async def chat_completions(
     body: ChatCompletionRequest,
     key: Annotated[ApiKey, Depends(require_customer_key)],
-    catalog: Annotated[dict[str, Provider], Depends(get_catalog)],
+    catalog: Annotated[Catalog, Depends(get_catalog)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> ChatCompletion:
     """Same request and response as OpenAI's POST /v1/chat/completions."""
     if body.stream:
         raise OpenAIError(status.HTTP_400_BAD_REQUEST, "Streaming is not supported", param="stream")
-    provider = catalog.get(body.model)
-    if provider is None:
+    resolved = catalog.resolve(body.model)
+    if resolved is None:
         raise OpenAIError(
             status.HTTP_404_NOT_FOUND,
             f"The model '{body.model}' does not exist",
             code="model_not_found",
             param="model",
         )
+    provider = resolved.provider
+    upstream = body.for_upstream(
+        resolved.upstream_model, body.output_cap(settings.default_max_tokens), stream=False
+    )
     try:
-        return await provider.complete(body)
+        return await provider.complete(upstream)
     except ProviderError as exc:
-        # The provider's own message may echo the prompt, so it stays out of the response.
-        raise OpenAIError(
-            status.HTTP_502_BAD_GATEWAY,
-            f"The provider '{provider.name}' failed to answer",
-            type="api_error",
-            code="provider_error",
-        ) from exc
+        raise _provider_failed(provider.name, exc) from exc
+
+
+def _provider_failed(provider: str, exc: ProviderError) -> OpenAIError:
+    if exc.is_client_error:
+        # The provider rejected the request itself (e.g. an unknown model); its reason helps
+        # the caller fix it, and goes only to the caller that sent the request.
+        detail = f": {exc.upstream_message}" if exc.upstream_message else ""
+        return OpenAIError(
+            status.HTTP_400_BAD_REQUEST,
+            f"The provider '{provider}' rejected the request{detail}",
+            code="provider_rejected_request",
+        )
+    return OpenAIError(
+        status.HTTP_502_BAD_GATEWAY,
+        f"The provider '{provider}' failed to answer",
+        type="api_error",
+        code="provider_error",
+    )

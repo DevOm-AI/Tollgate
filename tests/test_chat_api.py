@@ -2,25 +2,27 @@ import openai
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.config import Settings
+from app.core.http import http_client
 from app.main import app
 from app.providers.base import ChatCompletion, ChatCompletionRequest, ProviderError
-from app.providers.catalog import get_catalog
+from app.providers.catalog import Catalog, build_catalog, get_catalog
 from tests.test_admin_api import create_key
 
-MODEL = "test-model"
+MODEL = "fake/test-model"
 
 
 class FakeProvider:
     name = "fake"
 
-    def __init__(self, fail: bool = False) -> None:
-        self.fail = fail
+    def __init__(self) -> None:
+        self.error: ProviderError | None = None
         self.requests: list[ChatCompletionRequest] = []
 
     async def complete(self, request: ChatCompletionRequest) -> ChatCompletion:
         self.requests.append(request)
-        if self.fail:
-            raise ProviderError("upstream said: <the user's prompt>")
+        if self.error:
+            raise self.error
         return ChatCompletion(
             id="chatcmpl-1",
             created=1_790_000_000,
@@ -40,7 +42,7 @@ class FakeProvider:
 @pytest.fixture
 def provider(api: TestClient) -> FakeProvider:
     fake = FakeProvider()
-    app.dependency_overrides[get_catalog] = lambda: {MODEL: fake}
+    app.dependency_overrides[get_catalog] = lambda: Catalog([fake])
     return fake
 
 
@@ -205,13 +207,76 @@ def test_stream_is_refused_for_now(api, provider, customer_key):
 
 
 def test_provider_failure_is_502_without_its_message(api, provider, customer_key):
-    provider.fail = True
+    provider.error = ProviderError("fake: HTTP 500", status_code=500, upstream_message="prompt")
 
     response = chat(api, customer_key)
 
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "provider_error"
     assert "prompt" not in response.text
+
+
+def test_provider_connection_failure_is_502(api, provider, customer_key):
+    provider.error = ProviderError("fake: ConnectError")
+
+    assert chat(api, customer_key).status_code == 502
+
+
+@pytest.mark.parametrize("status_code", [400, 404, 422])
+def test_provider_rejecting_the_request_is_400_with_its_reason(
+    api, provider, customer_key, status_code
+):
+    provider.error = ProviderError(
+        "fake: HTTP", status_code=status_code, upstream_message="model 'x' not found"
+    )
+
+    response = chat(api, customer_key)
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "provider_rejected_request"
+    assert "model 'x' not found" in error["message"]
+
+
+# --- Models and token caps ---
+
+
+def test_provider_gets_its_own_model_name(api, provider, customer_key):
+    chat(api, customer_key)
+
+    assert provider.requests[0].model == "test-model"
+
+
+def test_default_max_tokens_is_applied(api, provider, customer_key):
+    chat(api, customer_key)
+
+    assert provider.requests[0].max_tokens == Settings(_env_file=None).default_max_tokens
+
+
+def test_max_completion_tokens_becomes_the_cap(api, provider, customer_key):
+    chat(api, customer_key, max_completion_tokens=50)
+
+    sent = provider.requests[0]
+    assert (sent.max_tokens, sent.max_completion_tokens) == (50, None)
+
+
+def test_mock_model_answers_through_the_openai_library(api, customer_key):
+    app.dependency_overrides[get_catalog] = lambda: build_catalog(
+        Settings(_env_file=None, mock_output_tokens=5), http_client
+    )
+    client = openai.OpenAI(
+        base_url="http://testserver/v1",
+        api_key=customer_key,
+        http_client=TestClient(app),
+        max_retries=0,
+    )
+
+    completion = client.chat.completions.create(
+        model="mock", messages=[{"role": "user", "content": "Say hello"}]
+    )
+
+    assert len(completion.choices[0].message.content.split()) == 5
+    assert completion.usage.completion_tokens == 5
 
 
 def test_admin_routes_keep_fastapi_validation_errors(api):

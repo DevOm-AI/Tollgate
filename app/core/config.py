@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import SecretStr, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Prefixes of Stripe keys that move real money.
@@ -44,6 +44,15 @@ class Settings(BaseSettings):
     # LLM provider keys. Unset = that provider isn't available.
     gemini_api_key: SecretStr | None = None
     groq_api_key: SecretStr | None = None
+
+    # max_tokens for requests that send neither max_tokens nor max_completion_tokens. Every
+    # request needs a cap: it bounds the worst-case cost that budgets reserve.
+    default_max_tokens: int = Field(default=1024, gt=0)
+
+    # The mock provider (model "mock"): fake answers that cost nothing, for tests and demos.
+    mock_delay_ms: int = Field(default=0, ge=0)
+    mock_output_tokens: int = Field(default=32, gt=0)
+    mock_error_rate: float = Field(default=0.0, ge=0.0, le=1.0)
 
     # Stripe secret key (sk_test_...). Unset = usage isn't reported to Stripe.
     stripe_secret_key: SecretStr | None = None

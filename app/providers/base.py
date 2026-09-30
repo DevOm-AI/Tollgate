@@ -1,4 +1,5 @@
-from typing import Any, Literal, Protocol
+from collections.abc import AsyncIterator
+from typing import Any, Literal, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -25,6 +26,21 @@ class ChatCompletionRequest(BaseModel):
     # One answer per request: several would multiply the cost of a single call.
     n: Literal[1] = 1
 
+    def output_cap(self, default: int) -> int:
+        """Most tokens the answer may have. max_completion_tokens is OpenAI's newer name."""
+        return self.max_completion_tokens or self.max_tokens or default
+
+    def for_upstream(self, model: str, max_tokens: int, *, stream: bool) -> Self:
+        """The request as a provider gets it: its own model name and one explicit cap."""
+        return self.model_copy(
+            update={
+                "model": model,
+                "max_tokens": max_tokens,
+                "max_completion_tokens": None,
+                "stream": stream,
+            }
+        )
+
 
 class Usage(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -45,8 +61,31 @@ class ChatCompletion(BaseModel):
     usage: Usage
 
 
+# Provider answers that blame the request itself, not the provider.
+CLIENT_ERROR_STATUSES = frozenset({400, 404, 413, 422})
+
+
 class ProviderError(Exception):
-    """The provider couldn't answer: connection error, timeout, or an error response."""
+    """The provider couldn't answer: connection error, timeout, or an error response.
+
+    `status_code` is the provider's HTTP status, or None if no response came back.
+    `upstream_message` is the provider's own error message, if it sent one.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        upstream_message: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.upstream_message = upstream_message
+
+    @property
+    def is_client_error(self) -> bool:
+        return self.status_code in CLIENT_ERROR_STATUSES
 
 
 class Provider(Protocol):
@@ -54,4 +93,10 @@ class Provider(Protocol):
 
     name: str
 
-    async def complete(self, request: ChatCompletionRequest) -> ChatCompletion: ...
+    async def complete(self, request: ChatCompletionRequest) -> ChatCompletion:
+        """One full answer."""
+        ...
+
+    def stream(self, request: ChatCompletionRequest) -> AsyncIterator[dict[str, Any]]:
+        """The answer as OpenAI chat.completion.chunk objects, in the order they arrive."""
+        ...
