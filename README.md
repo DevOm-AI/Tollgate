@@ -79,6 +79,61 @@ nothing; mid-stream it ends the stream with an error event.
 Errors come back in OpenAI's format too, so the library raises its usual exceptions
 (`AuthenticationError` for a wrong or revoked key, `NotFoundError` for an unknown model).
 
+## The overspend test
+
+A key with a **$1.00** budget, the mock provider priced at exactly **$0.01** per request, and
+**500 requests fired at the same moment** through the whole gateway (real Postgres, real Redis,
+a pooled database connection). Run 10 times, then 10 more with the atomic reservation swapped
+for a plain "check, then add" (read what's spent, compare with the budget, add the cost after
+the answer):
+
+#### Tollgate: reserve the worst case with one conditional UPDATE
+
+10 runs of 500 requests on a $1.00 budget: worst overspend $0.00, average $0.00
+
+| Run | Succeeded | 402 | Other | Spent | Overspend | Left reserved |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 100 | 400 | 0 | $1.00 | $0.00 | $0.00 |
+| 2 | 100 | 400 | 0 | $1.00 | $0.00 | $0.00 |
+| 3 | 100 | 400 | 0 | $1.00 | $0.00 | $0.00 |
+| 4 | 100 | 400 | 0 | $1.00 | $0.00 | $0.00 |
+| 5 | 100 | 400 | 0 | $1.00 | $0.00 | $0.00 |
+| 6 | 100 | 400 | 0 | $1.00 | $0.00 | $0.00 |
+| 7 | 100 | 400 | 0 | $1.00 | $0.00 | $0.00 |
+| 8 | 100 | 400 | 0 | $1.00 | $0.00 | $0.00 |
+| 9 | 100 | 400 | 0 | $1.00 | $0.00 | $0.00 |
+| 10 | 100 | 400 | 0 | $1.00 | $0.00 | $0.00 |
+
+#### Naive: "check, then add"
+
+10 runs of 500 requests on a $1.00 budget: worst overspend $3.65, average $3.13
+
+| Run | Succeeded | 402 | Other | Spent | Overspend | Left reserved |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 398 | 102 | 0 | $3.98 | $2.98 | $0.00 |
+| 2 | 443 | 57 | 0 | $4.43 | $3.43 | $0.00 |
+| 3 | 323 | 177 | 0 | $3.23 | $2.23 | $0.00 |
+| 4 | 465 | 35 | 0 | $4.65 | $3.65 | $0.00 |
+| 5 | 447 | 53 | 0 | $4.47 | $3.47 | $0.00 |
+| 6 | 429 | 71 | 0 | $4.29 | $3.29 | $0.00 |
+| 7 | 432 | 68 | 0 | $4.32 | $3.32 | $0.00 |
+| 8 | 383 | 117 | 0 | $3.83 | $2.83 | $0.00 |
+| 9 | 429 | 71 | 0 | $4.29 | $3.29 | $0.00 |
+| 10 | 382 | 118 | 0 | $3.82 | $2.82 | $0.00 |
+
+
+With the reservation: exactly 100 requests succeed, every other one gets `402`, spent is exactly
+$1.00, and nothing is left reserved, every run. With "check, then add", hundreds of requests
+pass the check while spent is still low, and the key overspends by over $3.
+
+Run it yourself (the compose Postgres and Redis must be up):
+
+```bash
+uv run python -m loadtest.overspend              # 10 runs of each, 500 requests
+```
+
+CI runs one round of each on every push (`tests/test_overspend.py`).
+
 ## Budgets
 
 Each key has a monthly budget (`monthly_budget_micros`, in micro-dollars: 1 USD = 1,000,000).
