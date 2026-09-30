@@ -127,6 +127,8 @@ def create_key(api: TestClient, **limits) -> dict:
 
 
 MODEL = "fake/test-model"
+# What the fake provider streams, one chunk per word.
+STREAM_WORDS = ["Hello", " from", " fake", " stream"]
 # Micro-dollars per 1,000 tokens: $1 per million input tokens, $2 per million output tokens.
 FAKE_PRICE = {
     "provider": "fake",
@@ -145,6 +147,11 @@ class FakeProvider:
         self.error: ProviderError | None = None
         self.completion_tokens = 4
         self.delay_s = 0.0
+        # Streaming: pause between chunks, whether usage is sent when asked for, and the
+        # chunk before which the stream breaks (None: it doesn't).
+        self.chunk_delay_s = 0.0
+        self.send_usage = True
+        self.break_before_chunk: int | None = None
         self.requests: list[ChatCompletionRequest] = []
 
     async def complete(self, request: ChatCompletionRequest) -> ChatCompletion:
@@ -170,6 +177,30 @@ class FakeProvider:
             },
             system_fingerprint="fp_fake",
         )
+
+    async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[dict]:
+        """Streams STREAM_WORDS one chunk each, then a finish chunk, then usage if asked."""
+        self.requests.append(request)
+        await asyncio.sleep(self.delay_s)
+        if self.error:
+            raise self.error
+        base = {"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1}
+        base["model"] = request.model
+        for i, word in enumerate(STREAM_WORDS):
+            if i == self.break_before_chunk:
+                raise ProviderError("fake: ReadError")
+            delta = {"content": word} | ({"role": "assistant"} if i == 0 else {})
+            yield base | {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+            await asyncio.sleep(self.chunk_delay_s)
+        yield base | {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        options = (request.model_extra or {}).get("stream_options") or {}
+        if self.send_usage and options.get("include_usage"):
+            usage = {
+                "prompt_tokens": 3,
+                "completion_tokens": self.completion_tokens,
+                "total_tokens": 3 + self.completion_tokens,
+            }
+            yield base | {"choices": [], "usage": usage}
 
 
 @pytest.fixture

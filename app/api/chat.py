@@ -1,19 +1,25 @@
+import json
+import math
 import time
-from typing import Annotated
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from typing import Annotated, Any
 
 import anyio
 from fastapi import APIRouter, Depends, Response, status
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.errors import OpenAIError
-from app.billing.budget import Outcome, reserve, settle
+from app.billing.budget import Hold, Outcome, reserve, settle
 from app.billing.pricing import cost_micros, max_prompt_tokens
 from app.core.config import Settings, get_settings
 from app.core.db import get_db
 from app.core.security import bearer, hash_api_key
 from app.limits.rate_limit import (
+    Admission,
     RateLimited,
     RateLimiter,
     get_rate_limiter,
@@ -24,6 +30,7 @@ from app.models import ApiKey, ModelPrice
 from app.providers.base import (
     ChatCompletion,
     ChatCompletionRequest,
+    Provider,
     ProviderError,
     estimate_prompt_tokens,
 )
@@ -56,7 +63,56 @@ def _invalid_key(message: str) -> OpenAIError:
     )
 
 
-@router.post("/chat/completions")
+@dataclass
+class GatedCall:
+    """A request that passed every gate (price, rate limits, budget) and holds its money.
+
+    Every way out must call `finish` exactly once, which settles both the budget and the
+    rate limits.
+    """
+
+    db: AsyncSession
+    limiter: RateLimiter
+    provider: Provider
+    upstream: ChatCompletionRequest
+    price: ModelPrice
+    admission: Admission
+    hold: Hold
+    model: str  # As the customer asked for it.
+    started: float
+
+    async def finish(
+        self, status_: str, input_tokens: int = 0, output_tokens: int = 0
+    ) -> dict[str, str]:
+        """Charge what was used, release the rest, and return the rate limit headers.
+
+        Shielded, so a cancelled request (client gone, shutdown) still settles instead of
+        leaving the money held until the sweep.
+        """
+        with anyio.CancelScope(shield=True):
+            await settle(
+                self.db,
+                self.hold,
+                cost_micros(
+                    input_tokens,
+                    output_tokens,
+                    self.price.input_micros_per_1k,
+                    self.price.output_micros_per_1k,
+                ),
+                Outcome(
+                    model=self.model,
+                    provider=self.provider.name,
+                    status=status_,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    latency_ms=round((time.perf_counter() - self.started) * 1000),
+                ),
+            )
+            tokens = await self.limiter.settle(self.admission, input_tokens + output_tokens)
+        return rate_limit_headers(self.admission.requests, tokens)
+
+
+@router.post("/chat/completions", response_model=ChatCompletion)
 async def chat_completions(
     body: ChatCompletionRequest,
     response: Response,
@@ -65,10 +121,47 @@ async def chat_completions(
     catalog: Annotated[Catalog, Depends(get_catalog)],
     settings: Annotated[Settings, Depends(get_settings)],
     limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
-) -> ChatCompletion:
-    """Same request and response as OpenAI's POST /v1/chat/completions."""
+) -> ChatCompletion | StreamingResponse:
+    """Same request and response as OpenAI's POST /v1/chat/completions, streaming included."""
+    call = await _open_call(body, key, db, catalog, settings, limiter)
     if body.stream:
-        raise OpenAIError(status.HTTP_400_BAD_REQUEST, "Streaming is not supported", param="stream")
+        return await _stream(call, body)
+
+    completion: ChatCompletion | None = None
+    failure: ProviderError | None = None
+    status_ = "error"  # Anything unexpected, until known otherwise.
+    try:
+        completion = await call.provider.complete(call.upstream)
+        status_ = "ok"
+    except ProviderError as exc:
+        failure = exc
+        status_ = "provider_error"
+    except anyio.get_cancelled_exc_class():
+        status_ = "cancelled"
+        raise
+    finally:
+        # An answer is charged; anything else releases the hold and bills nothing.
+        usage = completion.usage if completion else None
+        headers = await call.finish(
+            status_,
+            usage.prompt_tokens if usage else 0,
+            usage.completion_tokens if usage else 0,
+        )
+    if failure is not None:
+        raise _provider_failed(call.provider.name, failure, headers) from failure
+    response.headers.update(headers)
+    return completion
+
+
+async def _open_call(
+    body: ChatCompletionRequest,
+    key: ApiKey,
+    db: AsyncSession,
+    catalog: Catalog,
+    settings: Settings,
+    limiter: RateLimiter,
+) -> GatedCall:
+    """Find the provider and price, then pass the rate limits and reserve the budget."""
     resolved = catalog.resolve(body.model)
     if resolved is None:
         raise OpenAIError(
@@ -88,8 +181,14 @@ async def chat_completions(
             param="model",
         )
     upstream = body.for_upstream(
-        resolved.upstream_model, body.output_cap(settings.default_max_tokens), stream=False
+        resolved.upstream_model, body.output_cap(settings.default_max_tokens), stream=body.stream
     )
+    if body.stream:
+        # Ask for usage in the last chunk, so the stream can be billed from real counts.
+        options = (body.model_extra or {}).get("stream_options") or {}
+        upstream = upstream.model_copy(
+            update={"stream_options": {**options, "include_usage": True}}
+        )
 
     # Rate limits first: they're cheap (Redis) and keep floods off Postgres.
     # Worst case for tokens per minute: the whole prompt plus a full-length answer.
@@ -112,51 +211,145 @@ async def chat_completions(
         tokens = await limiter.settle(admission, 0)
         raise _budget_exceeded(worst_case, rate_limit_headers(admission.requests, tokens))
 
-    started = time.perf_counter()
-    completion: ChatCompletion | None = None
-    failure: ProviderError | None = None
+    return GatedCall(
+        db=db,
+        limiter=limiter,
+        provider=provider,
+        upstream=upstream,
+        price=price,
+        admission=admission,
+        hold=hold,
+        model=body.model,
+        started=time.perf_counter(),
+    )
+
+
+# Tell proxies (and the Hugging Face / nginx front) not to buffer: chunks must arrive as sent.
+STREAM_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+async def _stream(call: GatedCall, body: ChatCompletionRequest) -> StreamingResponse:
+    """Forward the provider's chunks as Server-Sent Events, as they arrive.
+
+    The first chunk is read before answering, so a provider that fails before any output
+    still gets a proper error status (and the hold is released). After that the status is
+    already 200: a failure mid-stream is sent as an error event, and what was generated
+    until then is billed.
+    """
+    options = (body.model_extra or {}).get("stream_options") or {}
+    tally = StreamTally(show_usage=bool(options.get("include_usage")))
+    chunks = call.provider.stream(call.upstream)
+    first: dict[str, Any] | None = None
+    status_ = "error"
+    try:
+        first = await anext(chunks)
+    except StopAsyncIteration:
+        pass
+    except ProviderError as exc:
+        headers = await _close_stream(call, chunks, tally, "provider_error")
+        raise _provider_failed(call.provider.name, exc, headers) from exc
+    except BaseException as exc:
+        status_ = "cancelled" if isinstance(exc, anyio.get_cancelled_exc_class()) else "error"
+        await _close_stream(call, chunks, tally, status_)
+        raise
+
+    return StreamingResponse(
+        _forward(call, first, chunks, tally),
+        media_type="text/event-stream",
+        headers=rate_limit_headers(call.admission.requests, call.admission.tokens) | STREAM_HEADERS,
+    )
+
+
+async def _forward(
+    call: GatedCall,
+    first: dict[str, Any] | None,
+    chunks: AsyncIterator[dict[str, Any]],
+    tally: "StreamTally",
+) -> AsyncIterator[str]:
     status_ = "error"  # Anything unexpected, until known otherwise.
     try:
-        completion = await provider.complete(upstream)
+        if first is not None:
+            for event in tally.forward(first):
+                yield event
+        async for chunk in chunks:
+            for event in tally.forward(chunk):
+                yield event
         status_ = "ok"
-    except ProviderError as exc:
-        failure = exc
+        yield "data: [DONE]\n\n"
+    except ProviderError:
         status_ = "provider_error"
+        yield _sse(
+            {
+                "error": {
+                    "message": f"The provider '{call.provider.name}' failed mid-answer",
+                    "type": "api_error",
+                    "param": None,
+                    "code": "provider_error",
+                }
+            }
+        )
     except anyio.get_cancelled_exc_class():
-        status_ = "cancelled"
+        status_ = "cancelled"  # The client went away.
         raise
     finally:
-        # Every way out settles: an answer is charged, anything else releases the hold and
-        # bills nothing. Shielded, so a cancelled request (e.g. a shutdown) still finishes
-        # this instead of leaving the money held until the sweep.
-        with anyio.CancelScope(shield=True):
-            usage = completion.usage if completion else None
-            await settle(
-                db,
-                hold,
-                cost_micros(
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    price.input_micros_per_1k,
-                    price.output_micros_per_1k,
-                )
-                if usage
-                else 0,
-                Outcome(
-                    model=body.model,
-                    provider=provider.name,
-                    status=status_,
-                    input_tokens=usage.prompt_tokens if usage else 0,
-                    output_tokens=usage.completion_tokens if usage else 0,
-                    latency_ms=round((time.perf_counter() - started) * 1000),
-                ),
+        await _close_stream(call, chunks, tally, status_)
+
+
+async def _close_stream(
+    call: GatedCall, chunks: AsyncIterator[dict[str, Any]], tally: "StreamTally", status_: str
+) -> dict[str, str]:
+    """Stop the provider's stream (no paying for tokens nobody reads), then settle."""
+    with anyio.CancelScope(shield=True):
+        aclose = getattr(chunks, "aclose", None)
+        if aclose is not None:
+            await aclose()
+    input_tokens, output_tokens = tally.tokens(call.upstream)
+    return await call.finish(status_, input_tokens, output_tokens)
+
+
+class StreamTally:
+    """Counts what a stream used, and shapes each chunk for the client."""
+
+    def __init__(self, *, show_usage: bool) -> None:
+        # Usage is always requested from the provider; the client only sees it if it asked.
+        self.show_usage = show_usage
+        self.usage: dict[str, Any] | None = None
+        self.output_chars = 0
+
+    def forward(self, chunk: dict[str, Any]) -> list[str]:
+        if isinstance(chunk.get("usage"), dict):
+            self.usage = chunk["usage"]
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if isinstance(delta.get("content"), str):
+                self.output_chars += len(delta["content"])
+            for tool_call in delta.get("tool_calls") or []:
+                arguments = (tool_call.get("function") or {}).get("arguments")
+                if isinstance(arguments, str):
+                    self.output_chars += len(arguments)
+        if not self.show_usage and "usage" in chunk:
+            chunk = {name: value for name, value in chunk.items() if name != "usage"}
+            if not chunk.get("choices"):
+                return []  # The usage-only last chunk the client didn't ask for.
+        return [_sse(chunk)]
+
+    def tokens(self, request: ChatCompletionRequest) -> tuple[int, int]:
+        """(input, output) tokens: the provider's count if it sent one, else an estimate.
+
+        Nothing generated means nothing billed: the provider failed before answering.
+        """
+        if self.usage is not None:
+            return int(self.usage.get("prompt_tokens") or 0), int(
+                self.usage.get("completion_tokens") or 0
             )
-            tokens = await limiter.settle(admission, usage.total_tokens if usage else 0)
-    headers = rate_limit_headers(admission.requests, tokens)
-    if failure is not None:
-        raise _provider_failed(provider.name, failure, headers) from failure
-    response.headers.update(headers)
-    return completion
+        if not self.output_chars:
+            return 0, 0
+        output = min(request.max_tokens or 0, math.ceil(self.output_chars / 4))
+        return estimate_prompt_tokens(request), output
+
+
+def _sse(data: dict[str, Any]) -> str:
+    return f"data: {json.dumps(data, separators=(',', ':'))}\n\n"
 
 
 def _budget_exceeded(worst_case: int, headers: dict[str, str]) -> OpenAIError:
