@@ -135,6 +135,15 @@ def test_seconds_until_available(breaker, clock):
     assert breaker.seconds_until_available() == 20
 
 
+def test_wait_is_positive_while_the_test_request_is_in_flight(breaker, clock):
+    fail(breaker, 5)
+    clock.now += 30
+    breaker.allow()  # The test request goes out.
+    clock.now += 5
+
+    assert breaker.seconds_until_available() == 25
+
+
 # --- In the endpoint ---
 
 

@@ -84,9 +84,14 @@ class CircuitBreaker:
         self._trial_started_at = None
 
     def seconds_until_available(self) -> int:
-        if self.state != "open":
+        """Whole seconds until `available` could be true (0 if it is now)."""
+        if self.available():
             return 0
-        return max(1, math.ceil(self._opened_at + self.open_s - self._clock()))
+        if self.state == "open":
+            until = self._opened_at + self.open_s
+        else:  # Half-open, with the test request in flight.
+            until = self._trial_started_at + self.open_s
+        return max(1, math.ceil(until - self._clock()))
 
     def snapshot(self) -> dict[str, Any]:
         return {"state": self.state, "recent_failures": len(self._failures)}
