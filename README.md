@@ -23,6 +23,9 @@ completion = client.chat.completions.create(
 print(completion.choices[0].message.content)
 ```
 
+`model` must be one Tollgate serves. No provider adapters are registered yet, so for now
+every model answers 404 `model_not_found`.
+
 Errors come back in OpenAI's format too, so the library raises its usual exceptions
 (`AuthenticationError` for a wrong or revoked key, `NotFoundError` for an unknown model).
 
