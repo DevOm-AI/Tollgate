@@ -34,6 +34,20 @@ Models:
 Requests without `max_tokens` (or `max_completion_tokens`) get `DEFAULT_MAX_TOKENS` (1,024), so
 every request has a known worst-case cost.
 
+Streaming works the same way, and words arrive as the provider sends them:
+
+```python
+for chunk in client.chat.completions.create(
+    model="mock", messages=[{"role": "user", "content": "Say hello"}], stream=True
+):
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+Tollgate asks the provider for token usage at the end of every stream and bills from it
+(passing it on only if you ask with `stream_options={"include_usage": True}`). If a provider
+fails before sending anything you get a normal error; if it fails mid-answer the stream ends
+with an error event and you're billed for what was sent.
+
 Errors come back in OpenAI's format too, so the library raises its usual exceptions
 (`AuthenticationError` for a wrong or revoked key, `NotFoundError` for an unknown model).
 

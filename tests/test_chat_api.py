@@ -159,13 +159,6 @@ def test_unknown_model_is_404(api, provider, customer_key):
     assert response.json()["error"]["code"] == "model_not_found"
 
 
-def test_stream_is_refused_for_now(api, provider, customer_key):
-    response = chat(api, customer_key, stream=True)
-
-    assert response.status_code == 400
-    assert response.json()["error"]["param"] == "stream"
-
-
 def test_provider_failure_is_502_without_its_message(api, provider, customer_key):
     provider.error = ProviderError("fake: HTTP 500", status_code=500, upstream_message="prompt")
 
