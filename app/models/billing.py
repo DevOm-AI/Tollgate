@@ -101,6 +101,8 @@ class UsageOutbox(Base):
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     customer_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("customers.id", ondelete="CASCADE"))
     cost_micros: Mapped[int] = mapped_column(BigInteger)
-    # The minute the usage belongs to; Stripe deduplicates on customer + minute.
+    # The minute the usage belongs to. Each settled request adds its own row; the Stripe
+    # push sums a customer's unsent rows per minute into one meter event, whose
+    # identifier (customer + minute) lets Stripe drop a retried duplicate.
     window_start: Mapped[datetime]
     sent_at: Mapped[datetime | None]
