@@ -42,6 +42,12 @@ problem. **Fallback only happens before the first byte reaches the client.** Onc
 answer has been streamed, switching providers would glue two different answers together, so a
 failure mid-stream ends the stream with an error event instead.
 
+Each provider has a circuit breaker: after 5 failures (timeouts, connection errors, `429`,
+`5xx`) within 30 s it opens and the provider gets no requests for 30 s, so requests go straight
+to the fallback instead of each waiting out a timeout. Then one test request goes through; a
+success closes the breaker again. If every provider in a route is open, the answer is `503`
+with `Retry-After`. `GET /health` shows each provider's breaker state.
+
 Requests without `max_tokens` (or `max_completion_tokens`) get `DEFAULT_MAX_TOKENS` (1,024), so
 every request has a known worst-case cost.
 

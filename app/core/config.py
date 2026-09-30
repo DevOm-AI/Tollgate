@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     provider_first_token_timeout_s: float = Field(default=30.0, gt=0)
     provider_total_timeout_s: float = Field(default=120.0, gt=0)
 
+    # Circuit breaker per provider: after this many failures within the window, stop sending
+    # it requests for breaker_open_s, then let one test request through.
+    breaker_failure_threshold: int = Field(default=5, gt=0)
+    breaker_window_s: float = Field(default=30.0, gt=0)
+    breaker_open_s: float = Field(default=30.0, gt=0)
+
     # Routes (see DEFAULT_ROUTES). From the environment as JSON:
     # ROUTES='{"fast-chat": ["groq/llama-3.1-8b-instant", "gemini/gemini-2.5-flash"]}'
     routes: dict[str, list[str]] = Field(default_factory=lambda: dict(DEFAULT_ROUTES))
