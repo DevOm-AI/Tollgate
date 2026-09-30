@@ -42,6 +42,11 @@ services:
       retries: 3
       start_period: 10s
 
+  # Background jobs: releases reservations left open past their expiry, once a minute.
+  jobs:
+    <<: *app
+    command: python -m app.jobs.sweep_reservations
+
   postgres:
     image: postgres:16-alpine
     environment:
