@@ -41,7 +41,11 @@ uv run python -m scripts.check_accounts
 
 ## Tests and lint
 
+Database tests create (and drop) their own scratch database on the compose Postgres, or on
+the server in `DATABASE_URL` if set.
+
 ```bash
+docker compose up -d postgres redis
 uv sync
 uv run ruff check .
 uv run ruff format --check .
