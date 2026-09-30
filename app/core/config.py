@@ -7,6 +7,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Prefixes of Stripe keys that move real money.
 STRIPE_LIVE_KEY_PREFIXES = ("sk_live_", "rk_live_")
 
+# Customer keys start with this; the admin key must not look like one.
+CUSTOMER_KEY_PREFIX = "tg_live_"
+ADMIN_API_KEY_MIN_LENGTH = 32
+
 
 def normalize_database_url(url: str) -> str:
     """Point plain Postgres URLs (what Neon's console copies) at the psycopg 3 driver."""
@@ -44,10 +48,27 @@ class Settings(BaseSettings):
     # Stripe secret key (sk_test_...). Unset = usage isn't reported to Stripe.
     stripe_secret_key: SecretStr | None = None
 
+    # Guards the /admin routes. Unset = those routes are disabled.
+    admin_api_key: SecretStr | None = None
+
     @field_validator("database_url")
     @classmethod
     def _use_psycopg(cls, value: str) -> str:
         return normalize_database_url(value)
+
+    @field_validator("admin_api_key")
+    @classmethod
+    def _check_admin_key(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        secret = value.get_secret_value()
+        if len(secret) < ADMIN_API_KEY_MIN_LENGTH:
+            raise ValueError(
+                f"ADMIN_API_KEY must be at least {ADMIN_API_KEY_MIN_LENGTH} characters"
+            )
+        if secret.startswith(CUSTOMER_KEY_PREFIX):
+            raise ValueError("ADMIN_API_KEY must not be a customer key")
+        return value
 
     @model_validator(mode="after")
     def _refuse_live_stripe_key(self) -> "Settings":

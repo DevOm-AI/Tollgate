@@ -39,6 +39,20 @@ variable it goes in. Then check them all without printing any:
 uv run python -m scripts.check_accounts
 ```
 
+## Admin API
+
+Customers and their keys are managed through `/admin` routes, guarded by `ADMIN_API_KEY` (at
+least 32 characters; unset disables them). Customer keys never work there.
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"name": "Acme"}' http://localhost:8001/admin/customers
+```
+
+Creating a key returns the full `tg_live_...` key once. Tollgate stores only its SHA-256 hash
+and the first 8 characters after `tg_live_`, for display. Limits can be changed later with
+`PATCH /admin/keys/{id}`, and `POST /admin/keys/{id}/revoke` turns a key off for good.
+
 ## Tests and lint
 
 Database tests create (and drop) their own scratch database on the compose Postgres, or on

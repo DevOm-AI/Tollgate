@@ -1,14 +1,18 @@
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.config import Config
+from fastapi.testclient import TestClient
 from sqlalchemy import Engine, create_engine, make_url, pool, text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
+from app.core.db import get_db
+from app.main import app
 
 ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
 
@@ -56,3 +60,32 @@ def db(db_engine: Engine) -> Iterator[Session]:
         finally:
             session.close()
             transaction.rollback()
+
+
+ADMIN_KEY = "test-admin-key-0123456789abcdefghijklmnop"
+
+
+@pytest.fixture
+def api(db_engine: Engine) -> Iterator[TestClient]:
+    """The app on the scratch database, with ADMIN_KEY as its admin key.
+
+    Requests commit for real (the scratch database is dropped at the end), so tests make
+    their own rows instead of assuming empty tables.
+    """
+    async_engine = create_async_engine(db_engine.url, poolclass=pool.NullPool)
+    sessions = async_sessionmaker(bind=async_engine, autoflush=False, expire_on_commit=False)
+
+    async def get_test_db() -> AsyncIterator[AsyncSession]:
+        async with sessions() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = get_test_db
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        _env_file=None, admin_api_key=ADMIN_KEY
+    )
+    try:
+        # Not entered as a context manager: that would run the lifespan, whose shutdown
+        # closes the app's shared Redis client and engine for the tests that follow.
+        yield TestClient(app, headers={"Authorization": f"Bearer {ADMIN_KEY}"})
+    finally:
+        app.dependency_overrides.clear()
