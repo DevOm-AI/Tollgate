@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     breaker_window_s: float = Field(default=30.0, gt=0)
     breaker_open_s: float = Field(default=30.0, gt=0)
 
+    # Browser origins allowed to call the API (the dashboard), as JSON:
+    # CORS_ORIGINS='["https://tollgate.vercel.app"]'
+    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+
     # Routes (see DEFAULT_ROUTES). From the environment as JSON:
     # ROUTES='{"fast-chat": ["groq/llama-3.1-8b-instant", "gemini/gemini-2.5-flash"]}'
     routes: dict[str, list[str]] = Field(default_factory=lambda: dict(DEFAULT_ROUTES))

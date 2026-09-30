@@ -2,9 +2,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.admin import router as admin_router
 from app.api.chat import router as chat_router
+from app.api.dashboard import router as dashboard_router
 from app.api.errors import install_error_handlers
 from app.api.health import router as health_router
 from app.core.config import get_settings
@@ -27,8 +29,24 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Tollgate", debug=settings.debug, lifespan=lifespan)
     app.include_router(health_router)
     app.include_router(admin_router)
+    app.include_router(dashboard_router)
     app.include_router(chat_router)
     install_error_handlers(app)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_methods=["GET", "POST", "PUT", "PATCH"],
+        allow_headers=["Authorization", "Content-Type"],
+        # So the dashboard and playground can read the limits off each response.
+        expose_headers=[
+            "Retry-After",
+            *(
+                f"X-RateLimit-{kind}-{limit}"
+                for kind in ("Limit", "Remaining", "Reset")
+                for limit in ("Requests", "Tokens")
+            ),
+        ],
+    )
     return app
 
 

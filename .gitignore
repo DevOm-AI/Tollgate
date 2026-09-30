@@ -17,6 +17,7 @@ build/
 
 # Dashboard (web/)
 node_modules/
+web/dist/
 
 # Editors / OS
 .idea/
