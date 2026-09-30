@@ -59,6 +59,11 @@ class RateLimiter:
         self, key_id: uuid.UUID, rpm_limit: int, tpm_limit: int, estimated_tokens: int
     ) -> Admission:
         """Take 1 request and the estimate, or raise RateLimited having taken neither."""
+        if estimated_tokens > tpm_limit:
+            # Can never fit, whatever the requests bucket says: report that, not a wait.
+            requests = await self._bucket.take(f"{key_id}:rpm", rpm_limit, 0)
+            tokens = await self._bucket.take(f"{key_id}:tpm", tpm_limit, estimated_tokens)
+            raise RateLimited("tokens", requests, tokens, cost=estimated_tokens)
         requests = await self._bucket.take(f"{key_id}:rpm", rpm_limit)
         if not requests.allowed:
             # Taking 0 reads the tokens bucket without changing it.

@@ -114,6 +114,20 @@ def test_too_large_429_has_no_retry_after(api, provider):
     assert response.headers["X-RateLimit-Remaining-Tokens"] == "100"
 
 
+def test_too_large_429_has_no_retry_after_even_with_requests_used_up(api, provider):
+    key = create_key(api, rpm_limit=1, tpm_limit=100)["key"]
+    chat(api, key, max_tokens=10)
+
+    response = chat(api, key, max_tokens=500)
+
+    assert response.status_code == 429
+    assert response.json()["error"]["type"] == "tokens"
+    assert "Request too large" in response.json()["error"]["message"]
+    assert "Retry-After" not in response.headers
+    assert response.headers["X-RateLimit-Remaining-Requests"] == "0"
+    assert all(name in response.headers for name in HEADER_NAMES)
+
+
 def test_provider_failure_still_reports_the_limits(api, provider):
     key = create_key(api, tpm_limit=1000)["key"]
     provider.error = ProviderError("fake: HTTP 500", status_code=500)
