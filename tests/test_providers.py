@@ -342,3 +342,36 @@ def test_catalog_does_not_resolve_unserved_models(model: str):
 
 def test_empty_catalog_resolves_nothing():
     assert Catalog([]).resolve("mock") is None
+
+
+class EndlessBody(httpx2.AsyncByteStream):
+    """A provider answer that never ends on its own, and records being closed."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def __aiter__(self):
+        chunk = {"object": "chat.completion.chunk", "choices": [{"delta": {"content": "x"}}]}
+        while True:
+            yield f"data: {json.dumps(chunk)}\n\n".encode()
+            await asyncio.sleep(0)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_closing_a_stream_closes_the_providers_response():
+    body = EndlessBody()
+    upstream = Upstream(
+        lambda req: httpx2.Response(200, stream=body, headers={"Content-Type": "text/event-stream"})
+    )
+
+    async def read_one_then_close() -> None:
+        chunks = GroqProvider("k", upstream.client()).stream(request())
+        await anext(chunks)
+        await chunks.aclose()
+
+    asyncio.run(read_one_then_close())
+
+    # The connection is dropped, so the provider stops generating.
+    assert body.closed

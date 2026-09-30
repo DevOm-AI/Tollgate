@@ -152,6 +152,9 @@ class FakeProvider:
         self.chunk_delay_s = 0.0
         self.send_usage = True
         self.break_before_chunk: int | None = None
+        # How far the last stream got: chunks sent, and whether it ran to the end.
+        self.streamed_chunks = 0
+        self.stream_completed = False
         self.requests: list[ChatCompletionRequest] = []
 
     async def complete(self, request: ChatCompletionRequest) -> ChatCompletion:
@@ -186,11 +189,14 @@ class FakeProvider:
             raise self.error
         base = {"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1}
         base["model"] = request.model
+        self.streamed_chunks = 0
+        self.stream_completed = False
         for i, word in enumerate(STREAM_WORDS):
             if i == self.break_before_chunk:
                 raise ProviderError("fake: ReadError")
             delta = {"content": word} | ({"role": "assistant"} if i == 0 else {})
             yield base | {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+            self.streamed_chunks += 1
             await asyncio.sleep(self.chunk_delay_s)
         yield base | {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
         options = (request.model_extra or {}).get("stream_options") or {}
@@ -201,6 +207,7 @@ class FakeProvider:
                 "total_tokens": 3 + self.completion_tokens,
             }
             yield base | {"choices": [], "usage": usage}
+        self.stream_completed = True
 
 
 @pytest.fixture

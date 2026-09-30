@@ -5,6 +5,7 @@ import time
 import uuid
 from collections.abc import Iterator
 
+import anyio
 import httpx2
 import openai
 import pytest
@@ -288,3 +289,132 @@ def test_stream_arrives_word_by_word(api, provider, live_url):
     # The first word shows up long before the answer is done: nothing is buffered.
     assert arrivals[0] < 0.25
     assert arrivals[-1] - arrivals[0] >= 0.8
+
+
+def test_client_disconnect_stops_the_provider_and_bills_what_was_generated(
+    api, provider, live_url, db_engine
+):
+    created = create_key(api)
+    provider.chunk_delay_s = 0.5
+
+    with httpx2.stream(
+        "POST",
+        f"{live_url}/v1/chat/completions",
+        json={"model": MODEL, "messages": [{"role": "user", "content": "Hi"}], "stream": True},
+        headers={"Authorization": f"Bearer {created['key']}"},
+        timeout=10,
+    ) as response:
+        for line in response.iter_lines():
+            if '"content"' in line:
+                break  # Read one word, then hang up.
+
+    deadline = time.monotonic() + 5
+    while True:
+        with Session(db_engine) as session:
+            request = session.scalars(
+                select(RequestLog).where(RequestLog.key_id == uuid.UUID(created["id"]))
+            ).one_or_none()
+        if request is not None or time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
+
+    assert request is not None, "the stream was never settled"
+    assert request.status == "cancelled"
+    # The provider was stopped early, not left generating tokens nobody reads.
+    assert not provider.stream_completed
+    assert provider.streamed_chunks < len(STREAM_WORDS)
+    # Billed for what the provider generated before the hang-up, nothing more.
+    generated = "".join(STREAM_WORDS[: provider.streamed_chunks])
+    assert request.output_tokens == count_text_tokens(generated)
+    assert spend(db_engine, created["id"])[1] == 0
+
+
+def call_asgi_with_hang_up(key: str, *, hang_up_by: str) -> None:
+    """POST a stream straight to the app as an ASGI 2.4 server would, and hang up:
+
+    - failed_send: after the first word, the next send fails (OSError)
+    - disconnect: after the first word, an http.disconnect arrives
+    - failed_start: sending the response start fails, before any body is sent
+    - early_disconnect: the client is gone before the first body chunk
+    """
+    body = json.dumps(
+        {"model": MODEL, "messages": [{"role": "user", "content": "Hi"}], "stream": True}
+    ).encode()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"test"),
+            (b"content-type", b"application/json"),
+            (b"authorization", f"Bearer {key}".encode()),
+        ],
+        "client": ("127.0.0.1", 50000),
+        "server": ("test", 80),
+    }
+
+    async def main() -> None:
+        first_word_sent = anyio.Event()
+        request_read = False
+
+        async def receive() -> dict:
+            nonlocal request_read
+            if not request_read:
+                request_read = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            if hang_up_by == "early_disconnect":
+                return {"type": "http.disconnect"}
+            if hang_up_by == "disconnect":
+                await first_word_sent.wait()
+                return {"type": "http.disconnect"}
+            await anyio.sleep_forever()
+
+        async def send(message: dict) -> None:
+            if hang_up_by == "failed_start" and message["type"] == "http.response.start":
+                raise OSError("connection reset by peer")
+            if first_word_sent.is_set() and hang_up_by == "failed_send":
+                raise OSError("connection reset by peer")
+            if message["type"] == "http.response.body" and b'"content"' in message["body"]:
+                first_word_sent.set()
+
+        with anyio.fail_after(10):
+            await app(scope, receive, send)
+
+    anyio.run(main)
+
+
+@pytest.mark.parametrize("hang_up_by", ["failed_send", "disconnect"])
+def test_hang_up_stops_the_provider_under_asgi_2_4(api, provider, db_engine, hang_up_by):
+    created = create_key(api)
+    provider.chunk_delay_s = 0.3
+
+    call_asgi_with_hang_up(created["key"], hang_up_by=hang_up_by)
+
+    request = logged(db_engine, created["id"])
+    assert request.status == "cancelled"
+    assert not provider.stream_completed
+    assert provider.streamed_chunks < len(STREAM_WORDS)
+    assert spend(db_engine, created["id"])[1] == 0
+
+
+@pytest.mark.parametrize("hang_up_by", ["failed_start", "early_disconnect"])
+def test_hang_up_before_the_first_chunk_is_sent_still_settles(api, provider, db_engine, hang_up_by):
+    # failed_start is the case where the forwarding generator never starts, so only the
+    # response's fallback can settle it; early_disconnect usually races just past that.
+    created = create_key(api)
+    provider.chunk_delay_s = 0.3
+
+    call_asgi_with_hang_up(created["key"], hang_up_by=hang_up_by)
+
+    request = logged(db_engine, created["id"])
+    assert request.status == "cancelled"
+    # The provider had generated its first word, so that's billed; nothing is left held.
+    assert request.output_tokens == count_text_tokens(STREAM_WORDS[0])
+    assert spend(db_engine, created["id"])[1] == 0
+    assert not provider.stream_completed
