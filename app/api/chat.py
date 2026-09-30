@@ -32,6 +32,7 @@ from app.providers.base import (
     ChatCompletionRequest,
     Provider,
     ProviderError,
+    ProviderTimeout,
     estimate_prompt_tokens,
 )
 from app.providers.catalog import Catalog, get_catalog
@@ -81,6 +82,14 @@ class GatedCall:
     hold: Hold
     model: str  # As the customer asked for it.
     started: float
+    first_token_timeout_s: float
+    deadline: float  # anyio.current_time() by which the whole answer must be in.
+
+    def time_left(self) -> float:
+        return max(0.0, self.deadline - anyio.current_time())
+
+    def first_token_time_left(self) -> float:
+        return min(self.first_token_timeout_s, self.time_left())
 
     async def finish(
         self, status_: str, input_tokens: int = 0, output_tokens: int = 0
@@ -132,11 +141,15 @@ async def chat_completions(
     failure: ProviderError | None = None
     status_ = "error"  # Anything unexpected, until known otherwise.
     try:
-        completion = await call.provider.complete(call.upstream)
+        with anyio.fail_after(call.time_left()):
+            completion = await call.provider.complete(call.upstream)
         status_ = "ok"
+    except TimeoutError:
+        failure = ProviderTimeout(f"{call.provider.name}: no answer in time")
+        status_ = "timeout"
     except ProviderError as exc:
         failure = exc
-        status_ = "provider_error"
+        status_ = _failure_status(exc)
     except anyio.get_cancelled_exc_class():
         status_ = "cancelled"
         raise
@@ -222,6 +235,8 @@ async def _open_call(
         hold=hold,
         model=body.model,
         started=time.perf_counter(),
+        first_token_timeout_s=settings.provider_first_token_timeout_s,
+        deadline=anyio.current_time() + settings.provider_total_timeout_s,
     )
 
 
@@ -303,19 +318,28 @@ async def _stream(call: GatedCall, body: ChatCompletionRequest) -> StreamingResp
     options = (body.model_extra or {}).get("stream_options") or {}
     tally = StreamTally(show_usage=bool(options.get("include_usage")))
     stream = OpenStream(call, call.provider.stream(call.upstream), tally)
+    # Chunks up to and including the first one with output. Providers often open with a
+    # role-only chunk before generating anything, so that doesn't count as the first token.
+    opening: list[dict[str, Any]] = []
     try:
-        first = await anext(stream.chunks)
+        with anyio.fail_after(call.first_token_time_left()):
+            while not (opening and _has_output(opening[-1])):
+                opening.append(await anext(stream.chunks))
     except StopAsyncIteration:
-        first = None
+        pass
+    except TimeoutError as exc:
+        headers = await stream.close("timeout")
+        timeout = ProviderTimeout(f"{call.provider.name}: no first token in time")
+        raise _provider_failed(call.provider.name, timeout, headers) from exc
     except ProviderError as exc:
-        headers = await stream.close("provider_error")
+        headers = await stream.close(_failure_status(exc))
         raise _provider_failed(call.provider.name, exc, headers) from exc
     except BaseException as exc:
         cancelled = isinstance(exc, anyio.get_cancelled_exc_class())
         await stream.close("cancelled" if cancelled else "error")
         raise
-    # Counted now: the provider generated it, so it's billed even if it's never sent.
-    first_events = tally.forward(first) if first is not None else []
+    # Counted now: the provider generated them, so they're billed even if never sent.
+    first_events = [event for chunk in opening for event in tally.forward(chunk)]
 
     return HangUpAwareStreamingResponse(
         _forward(stream, first_events),
@@ -330,20 +354,30 @@ async def _forward(stream: OpenStream, first_events: list[str]) -> AsyncIterator
     try:
         for event in first_events:
             yield event
-        async for chunk in stream.chunks:
+        while True:
+            # The deadline covers only the wait for the next chunk, never a yield: a cancel
+            # scope open across a yield breaks when the response closes this generator.
+            try:
+                with anyio.fail_after(stream.call.time_left()):
+                    chunk = await anext(stream.chunks)
+            except StopAsyncIteration:
+                break
             for event in stream.tally.forward(chunk):
                 yield event
         status_ = "ok"
         yield "data: [DONE]\n\n"
-    except ProviderError:
-        status_ = "provider_error"
+    except (ProviderError, TimeoutError) as exc:
+        timed_out = isinstance(exc, TimeoutError | ProviderTimeout)
+        status_ = "timeout" if timed_out else "provider_error"
+        name = stream.call.provider.name
         yield _sse(
             {
                 "error": {
-                    "message": f"The provider '{stream.call.provider.name}' failed mid-answer",
+                    "message": f"The provider '{name}' "
+                    + ("didn't finish in time" if timed_out else "failed mid-answer"),
                     "type": "api_error",
                     "param": None,
-                    "code": "provider_error",
+                    "code": "provider_timeout" if timed_out else "provider_error",
                 }
             }
         )
@@ -435,7 +469,31 @@ def _rate_limited(exc: RateLimited) -> OpenAIError:
     )
 
 
+def _has_output(chunk: dict[str, Any]) -> bool:
+    """Whether a stream chunk carries part of the answer (or ends it), not just metadata."""
+    if chunk.get("usage"):
+        return True
+    for choice in chunk.get("choices") or []:
+        delta = choice.get("delta") or {}
+        if delta.get("content") or delta.get("tool_calls") or choice.get("finish_reason"):
+            return True
+    return False
+
+
+def _failure_status(exc: ProviderError) -> str:
+    """How a failed call is recorded in the requests table."""
+    return "timeout" if isinstance(exc, ProviderTimeout) else "provider_error"
+
+
 def _provider_failed(provider: str, exc: ProviderError, headers: dict[str, str]) -> OpenAIError:
+    if isinstance(exc, ProviderTimeout):
+        return OpenAIError(
+            status.HTTP_504_GATEWAY_TIMEOUT,
+            f"The provider '{provider}' didn't answer in time",
+            type="api_error",
+            code="provider_timeout",
+            headers=headers,
+        )
     if exc.is_client_error:
         # The provider rejected the request itself (e.g. an unknown model); its reason helps
         # the caller fix it, and goes only to the caller that sent the request.

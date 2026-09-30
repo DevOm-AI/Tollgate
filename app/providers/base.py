@@ -102,6 +102,10 @@ class ProviderError(Exception):
         return self.status_code in CLIENT_ERROR_STATUSES
 
 
+class ProviderTimeout(ProviderError):
+    """The provider didn't connect, start answering, or finish answering in time."""
+
+
 class Provider(Protocol):
     """An LLM provider Tollgate forwards requests to."""
 

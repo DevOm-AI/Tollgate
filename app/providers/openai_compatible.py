@@ -5,7 +5,12 @@ from typing import Any
 import httpx2
 from pydantic import ValidationError
 
-from app.providers.base import ChatCompletion, ChatCompletionRequest, ProviderError
+from app.providers.base import (
+    ChatCompletion,
+    ChatCompletionRequest,
+    ProviderError,
+    ProviderTimeout,
+)
 
 # Longest provider error message passed back to the caller.
 UPSTREAM_MESSAGE_MAX_LENGTH = 500
@@ -34,7 +39,7 @@ class OpenAICompatibleProvider:
                 self._url, json=self._body(request, stream=False), headers=self._headers
             )
         except httpx2.HTTPError as exc:
-            raise ProviderError(f"{self.name}: {type(exc).__name__}") from exc
+            raise self._transport_error(exc) from exc
         if response.is_error:
             raise self._status_error(response)
         try:
@@ -62,7 +67,12 @@ class OpenAICompatibleProvider:
                     except ValueError as exc:
                         raise ProviderError(f"{self.name}: unreadable stream chunk") from exc
         except httpx2.HTTPError as exc:
-            raise ProviderError(f"{self.name}: {type(exc).__name__}") from exc
+            raise self._transport_error(exc) from exc
+
+    def _transport_error(self, exc: httpx2.HTTPError) -> ProviderError:
+        """No usable response: a timeout (connect, read, ...) or a broken connection."""
+        error = ProviderTimeout if isinstance(exc, httpx2.TimeoutException) else ProviderError
+        return error(f"{self.name}: {type(exc).__name__}")
 
     def _status_error(self, response: httpx2.Response) -> ProviderError:
         return ProviderError(

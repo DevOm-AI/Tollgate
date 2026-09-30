@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     # request needs a cap: it bounds the worst-case cost that budgets reserve.
     default_max_tokens: int = Field(default=1024, gt=0)
 
+    # Provider timeouts, in seconds: connecting, the first token of a streamed answer, and the
+    # whole answer. A provider that connects and then goes silent can't hang a request forever.
+    # (A non-streaming answer arrives whole, so only connect and total apply to it.)
+    provider_connect_timeout_s: float = Field(default=5.0, gt=0)
+    provider_first_token_timeout_s: float = Field(default=30.0, gt=0)
+    provider_total_timeout_s: float = Field(default=120.0, gt=0)
+
     # The mock provider (model "mock"): fake answers that cost nothing, for tests and demos.
     mock_delay_ms: int = Field(default=0, ge=0)
     mock_output_tokens: int = Field(default=32, gt=0)
