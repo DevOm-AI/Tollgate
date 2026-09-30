@@ -48,6 +48,11 @@ upper bound on the prompt plus `max_tokens`, at the model's price) with one cond
 code `budget_exceeded`. After the answer, one transaction charges the real cost, frees the
 rest, and records the request and its usage for Stripe. A failed call is charged nothing.
 
+If Tollgate crashes between reserving and settling, the money stays held until the
+reservation expires (10 minutes); a job then releases it and bills nothing, since the request
+never finished. Locally the `jobs` service runs it every minute
+(`python -m app.jobs.sweep_reservations`).
+
 Requests are only served for priced models. The mock is priced by the migrations; set the
 rest (per 1,000 tokens, in micro-dollars) with the admin API:
 
