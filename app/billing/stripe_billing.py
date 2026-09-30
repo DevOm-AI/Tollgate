@@ -122,6 +122,14 @@ class StripeBilling:
             }
         )
 
+    def usage_between(self, stripe_customer_id: str, start: int, end: int) -> int:
+        """Micro-dollars Stripe's meter holds for a customer between two Unix times."""
+        meter_id = self.ensure_meter()
+        summaries = self._client.v1.billing.meters.event_summaries.list(
+            meter_id, {"customer": stripe_customer_id, "start_time": start, "end_time": end}
+        )
+        return round(sum(summary.aggregated_value for summary in summaries))
+
     def set_up_customer(
         self, customer_id: uuid.UUID, name: str, stripe_customer_id: str | None
     ) -> CustomerBilling:

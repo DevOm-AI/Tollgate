@@ -8,7 +8,7 @@ import logging
 import anyio
 
 from app.billing.stripe_billing import get_stripe_billing
-from app.jobs import push_usage, sweep_reservations
+from app.jobs import push_usage, reconcile_usage, sweep_reservations
 
 logger = logging.getLogger("app.jobs")
 
@@ -21,6 +21,7 @@ async def main() -> None:
             logger.warning("STRIPE_SECRET_KEY is not set: usage stays in the outbox")
         else:
             jobs.start_soon(push_usage.run_forever, billing)
+            jobs.start_soon(reconcile_usage.run_forever, billing)
 
 
 if __name__ == "__main__":
