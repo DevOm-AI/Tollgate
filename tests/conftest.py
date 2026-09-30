@@ -70,6 +70,19 @@ def db(db_engine: Engine) -> Iterator[Session]:
 ADMIN_KEY = "test-admin-key-0123456789abcdefghijklmnop"
 
 
+async def reachable_redis() -> AsyncIterator[Redis]:
+    """The test Redis (REDIS_URL, else the compose Redis), as a get_redis override.
+
+    A client per request: each TestClient request runs on its own event loop, and a pooled
+    connection can't move between loops.
+    """
+    redis = Redis.from_url(Settings(_env_file=None).redis_url)
+    try:
+        yield redis
+    finally:
+        await redis.aclose()
+
+
 @pytest.fixture
 def api(db_engine: Engine) -> Iterator[TestClient]:
     """The app on the scratch database and the test Redis, with ADMIN_KEY as its admin key.
@@ -84,17 +97,8 @@ def api(db_engine: Engine) -> Iterator[TestClient]:
         async with sessions() as session:
             yield session
 
-    # A client per request: each TestClient request runs on its own event loop, and a
-    # pooled connection can't move between loops.
-    async def get_test_redis() -> AsyncIterator[Redis]:
-        redis = Redis.from_url(Settings(_env_file=None).redis_url)
-        try:
-            yield redis
-        finally:
-            await redis.aclose()
-
     app.dependency_overrides[get_db] = get_test_db
-    app.dependency_overrides[get_redis] = get_test_redis
+    app.dependency_overrides[get_redis] = reachable_redis
     app.dependency_overrides[get_settings] = lambda: Settings(
         _env_file=None, admin_api_key=ADMIN_KEY
     )
