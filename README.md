@@ -29,6 +29,16 @@ docker compose up --build
 
 API docs: http://localhost:8001/docs · Health: http://localhost:8001/health
 
+## Accounts and keys
+
+Tollgate uses free tiers only: Neon, Upstash, Hugging Face, Gemini, Groq and Stripe in test
+mode. [docs/accounts.md](docs/accounts.md) says where to get each key and which `.env`
+variable it goes in. Then check them all without printing any:
+
+```bash
+uv run python -m scripts.check_accounts
+```
+
 ## Tests and lint
 
 ```bash
