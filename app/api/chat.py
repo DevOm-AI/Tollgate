@@ -36,6 +36,7 @@ from app.providers.base import (
     ProviderTimeout,
     estimate_prompt_tokens,
 )
+from app.providers.breaker import Breakers, get_breakers
 from app.providers.catalog import Catalog, get_catalog
 from app.providers.tokens import count_usage
 
@@ -89,6 +90,7 @@ class GatedCall:
 
     db: AsyncSession
     limiter: RateLimiter
+    breakers: Breakers
     attempts: list[Attempt]
     admission: Admission
     hold: Hold
@@ -107,17 +109,40 @@ class GatedCall:
     def attempt(self) -> Attempt:
         return self.attempts[self.current]
 
-    def fall_back(self, error: ProviderError) -> bool:
-        """Move to the next provider if `error` is worth retrying elsewhere and one is left.
+    def use_next_available(self, start: int = 0) -> bool:
+        """Point at the first attempt from `start` whose circuit breaker lets a request
+        through, and start its timeouts. False if every one is open.
 
         Each provider gets its own first-token and total timeouts: a fresh provider deserves
         a fair chance. (Settings keep a route's worst case inside a reservation's lifetime.)
         """
-        if not error.retryable or self.current + 1 >= len(self.attempts):
-            return False
+        for index in range(start, len(self.attempts)):
+            if self.breakers[self.attempts[index].provider.name].allow():
+                self.current = index
+                self.deadline = anyio.current_time() + self.total_timeout_s
+                return True
+        return False
+
+    def report(self, error: ProviderError | None) -> None:
+        """Tell the current provider's breaker how the call went. A rejected request (e.g.
+        400) still means the provider is up; only timeouts, connection errors, 429 and 5xx
+        count against it."""
+        breaker = self.breakers[self.attempt.provider.name]
+        if error is not None and error.retryable:
+            breaker.record_failure()
+        else:
+            breaker.record_success()
+
+    def report_cancelled(self) -> None:
+        self.breakers[self.attempt.provider.name].release()
+
+    def fall_back(self, error: ProviderError) -> bool:
+        """Report `error`, then move to the next available provider if the error is worth
+        retrying elsewhere and one is left."""
+        self.report(error)
         failed = self.attempt.provider.name
-        self.current += 1
-        self.deadline = anyio.current_time() + self.total_timeout_s
+        if not error.retryable or not self.use_next_available(self.current + 1):
+            return False
         logger.warning(
             "Provider %s failed (%s); falling back to %s",
             failed,
@@ -125,6 +150,12 @@ class GatedCall:
             self.attempt.provider.name,
         )
         return True
+
+    def seconds_until_available(self) -> int:
+        return min(
+            self.breakers[attempt.provider.name].seconds_until_available()
+            for attempt in self.attempts
+        )
 
     def time_left(self) -> float:
         return max(0.0, self.deadline - anyio.current_time())
@@ -173,21 +204,26 @@ async def chat_completions(
     catalog: Annotated[Catalog, Depends(get_catalog)],
     settings: Annotated[Settings, Depends(get_settings)],
     limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
+    breakers: Annotated[Breakers, Depends(get_breakers)],
 ) -> ChatCompletion | StreamingResponse:
     """Same request and response as OpenAI's POST /v1/chat/completions, streaming included."""
-    call = await _open_call(body, key, db, catalog, settings, limiter)
+    call = await _open_call(body, key, db, catalog, settings, limiter, breakers)
     if body.stream:
         return await _stream(call, body)
 
     completion: ChatCompletion | None = None
     failure: ProviderError | None = None
     status_ = "error"  # Anything unexpected, until known otherwise.
+    unavailable = not call.use_next_available()
+    if unavailable:
+        status_ = "unavailable"  # Every breaker opened since the request was admitted.
     try:
-        while True:
+        while not unavailable:
             attempt = call.attempt
             try:
                 with anyio.fail_after(call.time_left()):
                     completion = await attempt.provider.complete(attempt.upstream)
+                call.report(None)
                 status_ = "ok"
                 break
             except TimeoutError:
@@ -201,6 +237,7 @@ async def chat_completions(
                 status_ = _failure_status(error)
                 break
     except anyio.get_cancelled_exc_class():
+        call.report_cancelled()
         status_ = "cancelled"
         raise
     finally:
@@ -211,6 +248,8 @@ async def chat_completions(
             usage.prompt_tokens if usage else 0,
             usage.completion_tokens if usage else 0,
         )
+    if unavailable:
+        raise _providers_unavailable(body.model, call.seconds_until_available(), headers)
     if failure is not None:
         raise _provider_failed(call.attempt.provider.name, failure, headers) from failure
     response.headers.update(headers)
@@ -224,6 +263,7 @@ async def _open_call(
     catalog: Catalog,
     settings: Settings,
     limiter: RateLimiter,
+    breakers: Breakers,
 ) -> GatedCall:
     """Find the provider and price, then pass the rate limits and reserve the budget."""
     candidates = catalog.candidates(body.model)
@@ -266,6 +306,10 @@ async def _open_call(
             code="model_not_priced",
             param="model",
         )
+    if not any(breakers[attempt.provider.name].available() for attempt in attempts):
+        # Every provider's breaker is open: fail fast, before taking any limits or money.
+        wait = min(breakers[a.provider.name].seconds_until_available() for a in attempts)
+        raise _providers_unavailable(body.model, wait, {})
     primary = attempts[0]
 
     # Rate limits first: they're cheap (Redis) and keep floods off Postgres. One admission
@@ -293,6 +337,7 @@ async def _open_call(
     return GatedCall(
         db=db,
         limiter=limiter,
+        breakers=breakers,
         attempts=attempts,
         admission=admission,
         hold=hold,
@@ -391,6 +436,9 @@ async def _stream(call: GatedCall, body: ChatCompletionRequest) -> StreamingResp
     """
     options = (body.model_extra or {}).get("stream_options") or {}
     tally = StreamTally(show_usage=bool(options.get("include_usage")))
+    if not call.use_next_available():
+        headers = await call.finish("unavailable")
+        raise _providers_unavailable(body.model, call.seconds_until_available(), headers)
     while True:
         attempt = call.attempt
         stream = OpenStream(call, attempt.provider.stream(attempt.upstream), tally)
@@ -401,8 +449,10 @@ async def _stream(call: GatedCall, body: ChatCompletionRequest) -> StreamingResp
             with anyio.fail_after(call.first_token_time_left()):
                 while not (opening and _has_output(opening[-1])):
                     opening.append(await anext(stream.chunks))
+            call.report(None)
             break
         except StopAsyncIteration:
+            call.report(None)
             break
         except TimeoutError:
             error: ProviderError = ProviderTimeout(
@@ -412,6 +462,7 @@ async def _stream(call: GatedCall, body: ChatCompletionRequest) -> StreamingResp
             error = exc
         except BaseException as exc:
             cancelled = isinstance(exc, anyio.get_cancelled_exc_class())
+            call.report_cancelled()
             await stream.close("cancelled" if cancelled else "error")
             raise
         if call.fall_back(error):
@@ -452,6 +503,8 @@ async def _forward(stream: OpenStream, first_events: list[str]) -> AsyncIterator
     except (ProviderError, TimeoutError) as exc:
         timed_out = isinstance(exc, TimeoutError | ProviderTimeout)
         status_ = "timeout" if timed_out else "provider_error"
+        # A provider that breaks mid-answer counts against its breaker.
+        stream.call.report(exc if isinstance(exc, ProviderError) else ProviderTimeout("mid-stream"))
         name = stream.call.attempt.provider.name
         yield _sse(
             {
@@ -549,6 +602,16 @@ def _rate_limited(exc: RateLimited) -> OpenAIError:
         type=exc.limit,
         code="rate_limit_exceeded",
         headers=headers,
+    )
+
+
+def _providers_unavailable(model: str, wait_s: int, headers: dict[str, str]) -> OpenAIError:
+    return OpenAIError(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        f"Every provider for '{model}' is failing right now. Try again in {wait_s}s.",
+        type="api_error",
+        code="providers_unavailable",
+        headers=headers | {"Retry-After": str(wait_s)},
     )
 
 

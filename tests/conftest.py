@@ -17,6 +17,7 @@ from app.core.db import get_db
 from app.core.redis import get_redis
 from app.main import app
 from app.providers.base import ChatCompletion, ChatCompletionRequest, ProviderError
+from app.providers.breaker import Breakers, get_breakers
 from app.providers.catalog import Catalog, get_catalog
 
 ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
@@ -99,6 +100,9 @@ def api(db_engine: Engine) -> Iterator[TestClient]:
 
     app.dependency_overrides[get_db] = get_test_db
     app.dependency_overrides[get_redis] = reachable_redis
+    # Fresh circuit breakers: failures in one test mustn't open a breaker in the next.
+    breakers = Breakers()
+    app.dependency_overrides[get_breakers] = lambda: breakers
     app.dependency_overrides[get_settings] = lambda: Settings(
         _env_file=None, admin_api_key=ADMIN_KEY
     )
@@ -235,3 +239,9 @@ def chat(api: TestClient, key: str, **body) -> dict:
     return api.post(
         "/v1/chat/completions", json=payload, headers={"Authorization": f"Bearer {key}"}
     )
+
+
+@pytest.fixture
+def breakers(api: TestClient) -> Breakers:
+    """The circuit breakers the app uses in this test."""
+    return app.dependency_overrides[get_breakers]()
